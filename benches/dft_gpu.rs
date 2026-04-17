@@ -4,7 +4,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
-use p3_field::{Field, PrimeCharacteristicRing, extension::BinomialExtensionField};
+use p3_field::{Field, extension::BinomialExtensionField};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_multilinear_util::{point::Point, poly::Poly};
@@ -58,32 +58,27 @@ fn benchmark_raw_dft(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_dft");
 
     for log_n in [14, 16, 18, 20, 22] {
-        let n: usize = 1 << log_n;
-        let width = 16;
-        let mut rng = SmallRng::seed_from_u64(0);
-        let values: Vec<F> = (0..n * width).map(|_| rng.random()).collect();
+        for width in [16, 32, 64] {
+            let n: usize = 1 << log_n;
+            let mut rng = SmallRng::seed_from_u64(0);
+            let values: Vec<F> = (0..n * width).map(|_| rng.random()).collect();
 
-        let cpu_dft = Radix2DFTSmallBatch::<F>::new(n);
-        group.bench_function(&format!("cpu_{log_n}x{width}"), |b| {
-            b.iter(|| {
-                let mat = RowMajorMatrix::new(values.clone(), width);
-                cpu_dft.dft_batch(mat)
+            let cpu_dft = Radix2DFTSmallBatch::<F>::new(n);
+            group.bench_function(&format!("cpu_{log_n}x{width}"), |b| {
+                b.iter(|| {
+                    let mat = RowMajorMatrix::new(values.clone(), width);
+                    cpu_dft.dft_batch(mat)
+                });
             });
-        });
 
-        let gpu_dft = MetalBabyBearDft::new(n);
-        group.bench_function(&format!("metal_gpu_{log_n}x{width}"), |b| {
-            b.iter(|| {
-                let mat = RowMajorMatrix::new(values.clone(), width);
-                gpu_dft.dft_batch(mat)
+            let gpu_dft = MetalBabyBearDft::new(n);
+            group.bench_function(&format!("metal_gpu_{log_n}x{width}"), |b| {
+                b.iter(|| {
+                    let mat = RowMajorMatrix::new(values.clone(), width);
+                    gpu_dft.dft_batch(mat)
+                });
             });
-        });
-
-        group.bench_function(&format!("clone_overhead_{log_n}x{width}"), |b| {
-            b.iter(|| {
-                values.clone()
-            });
-        });
+        }
     }
 
     group.finish();

@@ -26,8 +26,6 @@ use p3_util::log2_strict_usize;
 
 const SHADER_MSL: &str = include_str!("../shaders/babybear_ntt.metal");
 
-/// Max threadgroup shared memory in uint32 elements (32 KB / 4).
-const MAX_SHARED_ELEMS: u32 = 8192;
 
 /// Precompute twiddle factors in **Montgomery form** (raw `BabyBear` representation).
 /// The GPU shader uses Montgomery multiplication, so twiddles must be in the same form.
@@ -53,13 +51,6 @@ fn babybear_vec_to_u32(v: Vec<BabyBear>) -> Vec<u32> {
     unsafe { Vec::from_raw_parts(ptr.cast::<u32>(), len, cap) }
 }
 
-/// Reinterpret `Vec<u32>` as `Vec<BabyBear>` (zero-cost, same layout).
-fn u32_vec_to_babybear(v: Vec<u32>) -> Vec<BabyBear> {
-    let mut v = std::mem::ManuallyDrop::new(v);
-    let (ptr, len, cap) = (v.as_mut_ptr(), v.len(), v.capacity());
-    // SAFETY: BabyBear is #[repr(transparent)] over u32 — identical layout.
-    unsafe { Vec::from_raw_parts(ptr.cast::<BabyBear>(), len, cap) }
-}
 
 /// Metal-backed DFT for BabyBear (macOS).
 /// Falls back to CPU for small sizes or if the GPU fails.
@@ -70,10 +61,12 @@ pub struct MetalBabyBearDft {
     queue: metal::CommandQueue,
     bitrev_ps: ComputePipelineState,
     butterfly_ps: ComputePipelineState,
+    butterfly_r4_ps: ComputePipelineState,
+    butterfly_r8_ps: ComputePipelineState,
     shared_mem_ps: ComputePipelineState,
     /// Hard upper bound on the shared-memory block log from the device
-    /// (max threads per threadgroup). The actual `log_block` used per call
-    /// is `min(this, log2(MAX_SHARED_ELEMS / width), log_n)`.
+    /// (max threads per threadgroup). The kernel tiles columns internally,
+    /// so the actual `log_block` is just `min(this, log_n)`.
     max_log_shared_block: u32,
     twiddle_bufs: Mutex<HashMap<u32, Buffer>>,
 }
@@ -114,6 +107,8 @@ impl MetalBabyBearDft {
 
         let bitrev_ps = make_ps("bb_ntt_bitrev");
         let butterfly_ps = make_ps("bb_ntt_butterfly");
+        let butterfly_r4_ps = make_ps("bb_ntt_butterfly_r4");
+        let butterfly_r8_ps = make_ps("bb_ntt_butterfly_r8");
         let shared_mem_ps = make_ps("bb_ntt_shared_mem");
 
         let max_tg = shared_mem_ps.max_total_threads_per_threadgroup() as u32;
@@ -126,6 +121,8 @@ impl MetalBabyBearDft {
             queue,
             bitrev_ps,
             butterfly_ps,
+            butterfly_r4_ps,
+            butterfly_r8_ps,
             shared_mem_ps,
             max_log_shared_block,
             twiddle_bufs: Mutex::new(HashMap::new()),
@@ -148,14 +145,10 @@ impl MetalBabyBearDft {
             .clone()
     }
 
-    /// Effective log_block for a given (log_n, width): the number of butterfly
-    /// stages fused inside the shared-memory kernel.
-    fn effective_log_block(&self, log_n: u32, width: u32) -> u32 {
-        // block_size * width ≤ MAX_SHARED_ELEMS  →  block_size ≤ MAX_SHARED_ELEMS / width
-        let max_block_for_width = (MAX_SHARED_ELEMS / width).max(1).ilog2();
-        self.max_log_shared_block
-            .min(max_block_for_width)
-            .min(log_n)
+    /// Number of butterfly stages fused in the shared-memory kernel.
+    /// Column tiling inside the kernel means this no longer depends on width.
+    fn effective_log_block(&self, log_n: u32) -> u32 {
+        self.max_log_shared_block.min(log_n)
     }
 
     fn try_gpu_dft_batch(&self, mat: &RowMajorMatrix<BabyBear>) -> Option<RowMajorMatrix<BabyBear>> {
@@ -166,63 +159,39 @@ impl MetalBabyBearDft {
             return None;
         }
 
-        // Zero-copy: BabyBear is #[repr(transparent)] over u32 (Montgomery form).
-        // GPU shader now operates in Montgomery form, so no conversion needed.
-        let mut buf = babybear_vec_to_u32(mat.values.clone());
+        let total = height * width;
+        let total_bytes = (total * size_of::<u32>()) as u64;
+        let opts =
+            MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
+        let tw = self.twiddle_buffer(log_n);
+
+        // Single memcpy into Metal buffer — no clone, no intermediate Vec.
+        // BabyBear is #[repr(transparent)] over u32 (Montgomery form).
+        let data_buf =
+            self.device
+                .new_buffer_with_data(mat.values.as_ptr().cast(), total_bytes, opts);
 
         autoreleasepool(|| {
-            self.ntt_row_major(&mut buf, log_n, height as u32, width as u32)
-                .ok()
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            self.encode_batch_ntt(&enc, &data_buf, &tw, log_n, height as u32, width as u32);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            (cmd.status() != MTLCommandBufferStatus::Error).then_some(())
         })?;
 
-        // Reinterpret u32 results (Montgomery form) back as BabyBear.
-        let result = u32_vec_to_babybear(buf);
+        // Single memcpy out of Metal buffer → result.
+        let mut result = Vec::<BabyBear>::with_capacity(total);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_buf.contents() as *const BabyBear,
+                result.as_mut_ptr(),
+                total,
+            );
+            result.set_len(total);
+        }
         Some(RowMajorMatrix::new(result, width))
-    }
-
-    /// Run the NTT on **row-major** data in-place. `buf` has `height * width`
-    /// elements laid out as `buf[row * width + col]`.
-    fn ntt_row_major(
-        &self,
-        buf: &mut [u32],
-        log_n: u32,
-        height: u32,
-        width: u32,
-    ) -> Result<(), String> {
-        let tw = self.twiddle_buffer(log_n);
-        let total_bytes = (buf.len() * size_of::<u32>()) as u64;
-        let data_buf = self.device.new_buffer(
-            total_bytes,
-            MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared,
-        );
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                data_buf.contents() as *mut u32,
-                buf.len(),
-            );
-        }
-
-        let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-
-        self.encode_batch_ntt(&enc, &data_buf, &tw, log_n, height, width);
-
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-        if cmd.status() == MTLCommandBufferStatus::Error {
-            return Err("Metal command buffer failed".into());
-        }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data_buf.contents() as *const u32,
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
-        }
-        Ok(())
     }
 
     /// Encode the full batched NTT (bitrev + shared-mem fused stages +
@@ -236,7 +205,7 @@ impl MetalBabyBearDft {
         height: u32,
         width: u32,
     ) {
-        let log_block = self.effective_log_block(log_n, width);
+        let log_block = self.effective_log_block(log_n);
         let block_size = 1u32 << log_block;
 
         // Helper: push a u32 constant at `index`.
@@ -282,32 +251,86 @@ impl MetalBabyBearDft {
         }
 
         // ── Step 3 (Phase A): remaining global-memory butterfly stages ──
+        // Use the largest radix first to minimise dispatches:
+        //   remaining = 3·n_r8 + leftover  where leftover ∈ {0,1,2}
+        //   leftover 2 → 1 R4 dispatch,  leftover 1 → 1 R2 dispatch.
         if log_block < log_n {
-            enc.set_compute_pipeline_state(&self.butterfly_ps);
-            let num_butterflies = height >> 1;
+            let remaining = log_n - log_block;
+            let num_r8 = remaining / 3;
+            let leftover = remaining % 3;
+            let res: &metal::ResourceRef = data.deref();
+            let tg_w = width.min(32);
+            let mut stage = log_block;
 
-            for stage in log_block..log_n {
-                let res: &metal::ResourceRef = data.deref();
+            // Radix-8 dispatches (3 stages each).
+            if num_r8 > 0 {
+                let num_units = height >> 3;
+                let max_tg = self.butterfly_r8_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.butterfly_r8_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                for _ in 0..num_r8 {
+                    enc.memory_barrier_with_resources(&[res]);
+                    set_u32(enc, 4, stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                    stage += 3;
+                }
+            }
+
+            // Leftover 2 → one radix-4 dispatch.
+            if leftover == 2 {
+                let num_units = height >> 2;
+                let max_tg = self.butterfly_r4_ps.max_total_threads_per_threadgroup() as u32;
                 enc.memory_barrier_with_resources(&[res]);
+                enc.set_compute_pipeline_state(&self.butterfly_r4_ps);
                 enc.set_buffer(0, Some(data), 0);
                 enc.set_buffer(1, Some(twiddles), 0);
                 set_u32(enc, 2, height);
                 set_u32(enc, 3, width);
                 set_u32(enc, 4, stage);
-                let grid = MTLSize {
-                    width: width as u64,
-                    height: num_butterflies as u64,
-                    depth: 1,
-                };
-                let tg = MTLSize {
-                    width: width.min(32) as u64,
-                    height: (self.butterfly_ps.max_total_threads_per_threadgroup() as u32
-                        / width.min(32))
-                    .min(num_butterflies) as u64,
-                    depth: 1,
-                };
-                enc.dispatch_threads(grid, tg);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                stage += 2;
             }
+
+            // Leftover 1 → one radix-2 dispatch.
+            if leftover == 1 {
+                let num_butterflies = height >> 1;
+                let max_tg = self.butterfly_ps.max_total_threads_per_threadgroup() as u32;
+                enc.memory_barrier_with_resources(&[res]);
+                enc.set_compute_pipeline_state(&self.butterfly_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_butterflies) as u64,
+                        depth: 1,
+                    },
+                );
+                stage += 1;
+            }
+
+            debug_assert_eq!(stage, log_n);
         }
     }
 }
@@ -360,7 +383,7 @@ mod tests {
 
         for log_n in 2..=20 {
             let n = 1usize << log_n;
-            for &width in &[1, 4, 16] {
+            for &width in &[1, 4, 16, 32, 64] {
                 let values: Vec<BabyBear> = (0..n * width).map(|_| rng.random()).collect();
                 let cpu_result =
                     cpu_dft.dft_batch(RowMajorMatrix::new(values.clone(), width));
