@@ -2,7 +2,6 @@ use alloc::vec;
 
 use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
-use p3_dft::Radix2DFTSmallBatch;
 use p3_field::{Field, PrimeCharacteristicRing, extension::BinomialExtensionField};
 use p3_matrix::dense::DenseMatrix;
 use p3_merkle_tree::{MerkleTree, MerkleTreeMmcs};
@@ -11,6 +10,7 @@ use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use rand::{SeedableRng, rngs::SmallRng};
 
 use crate::{
+    BabyBearDft,
     constraints::statement::initial::InitialStatement,
     fiat_shamir::domain_separator::DomainSeparator,
     parameters::{
@@ -131,7 +131,7 @@ fn setup_domain_and_commitment(
     // which includes the Merkle tree and polynomial values.
     let prover_data = committer
         .commit(
-            &Radix2DFTSmallBatch::<F>::default(),
+            &BabyBearDft::default(),
             &mut proof,
             &mut prover_challenger,
             &mut initial_statement,

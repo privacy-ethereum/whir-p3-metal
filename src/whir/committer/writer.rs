@@ -126,7 +126,6 @@ mod tests {
 
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
     use p3_challenger::DuplexChallenger;
-    use p3_dft::Radix2DFTSmallBatch;
     use p3_merkle_tree::MerkleTreeMmcs;
     use p3_multilinear_util::poly::Poly;
     use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
@@ -134,6 +133,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        BabyBearDft,
         fiat_shamir::domain_separator::DomainSeparator,
         parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, SumcheckStrategy},
     };
@@ -199,7 +199,7 @@ mod tests {
         let mut statement = params.initial_statement(polynomial, SumcheckStrategy::Classic);
         // Run the Commitment Phase
         let committer = CommitmentWriter::new(&params);
-        let dft = Radix2DFTSmallBatch::<F>::default();
+        let dft = BabyBearDft::default();
         let _ = committer
             .commit(&dft, &mut proof, &mut challenger, &mut statement)
             .unwrap();
@@ -272,7 +272,7 @@ mod tests {
         domainsep.observe_domain_separator(&mut challenger);
 
         let mut statement = params.initial_statement(polynomial, SumcheckStrategy::Classic);
-        let dft = Radix2DFTSmallBatch::<F>::default();
+        let dft = BabyBearDft::default();
         let committer = CommitmentWriter::new(&params);
         let _ = committer
             .commit(&dft, &mut proof, &mut challenger, &mut statement)
@@ -329,7 +329,7 @@ mod tests {
         domainsep.observe_domain_separator(&mut challenger);
 
         let mut statement = params.initial_statement(polynomial, SumcheckStrategy::Classic);
-        let dft = Radix2DFTSmallBatch::<F>::default();
+        let dft = BabyBearDft::default();
         let committer = CommitmentWriter::new(&params);
         let _ = committer
             .commit(&dft, &mut proof, &mut challenger, &mut statement)
