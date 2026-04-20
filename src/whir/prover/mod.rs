@@ -175,7 +175,6 @@ where
             mat
         });
 
-        // Perform DFT on the padded evaluations matrix
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
             .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
 

@@ -305,7 +305,7 @@ fn benchmark_whir_prove(c: &mut Criterion) {
                 let committer = CommitmentWriter::new(&gpu_params);
                 let mut stmt = initial_statement.clone();
                 let prover_data = committer
-                    .commit(&dft, &mut proof, &mut challenger, &mut stmt)
+                    .commit_fused(&dft, &mut proof, &mut challenger, &mut stmt)
                     .unwrap();
                 let prover = Prover(&gpu_params);
                 prover

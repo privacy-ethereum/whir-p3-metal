@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Deref;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
@@ -25,7 +25,41 @@ use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_util::log2_strict_usize;
 
+use p3_commit::Mmcs;
+use p3_field::BasedVectorSpace;
+
 const SHADER_MSL: &str = include_str!("../shaders/babybear_ntt.metal");
+
+/// Optional DFT+Merkle fusion for MMCS implementations.
+/// Returns `Ok(commitment, tree)` on success, `Err(mat)` on failure
+/// (returning the unconsumed matrix for fallback).
+pub trait DftCommitFusion<F: Field>: Mmcs<F> {
+    fn dft_and_commit(
+        &self,
+        mat: RowMajorMatrix<F>,
+    ) -> Result<
+        (Self::Commitment, Self::ProverData<RowMajorMatrix<F>>),
+        RowMajorMatrix<F>,
+    > {
+        Err(mat)
+    }
+
+    fn dft_algebra_and_commit<EF>(
+        &self,
+        mat: RowMajorMatrix<EF>,
+    ) -> Result<
+        (
+            Self::Commitment,
+            Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
+        ),
+        RowMajorMatrix<EF>,
+    >
+    where
+        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
+    {
+        Err(mat)
+    }
+}
 
 /// Build the Poseidon2 BabyBear width-16 constants buffer (143 Montgomery u32s)
 /// by replicating the same RNG sampling as `Poseidon2::new_from_rng_128`.
@@ -212,6 +246,8 @@ pub struct MetalBabyBearDft {
     temp_buf_cache: Mutex<Option<Buffer>>,
     /// Cached data buffer (avoids per-call allocation).
     data_buf_cache: Mutex<Option<Buffer>>,
+    #[allow(dead_code)]
+    dft_result_cache: Arc<Mutex<Option<(usize, usize, Buffer)>>>,
     // Poseidon2 Merkle hashing pipeline states
     poseidon2_hash_leaves_ps: ComputePipelineState,
     poseidon2_compress_ps: ComputePipelineState,
@@ -221,7 +257,11 @@ pub struct MetalBabyBearDft {
 
 impl Clone for MetalBabyBearDft {
     fn clone(&self) -> Self {
-        Self::new_with_params(self.cpu.clone(), self.gpu_min_log_n, Self::DEFAULT_POSEIDON2_SEED)
+        let mut new = Self::new_with_params(self.cpu.clone(), self.gpu_min_log_n, Self::DEFAULT_POSEIDON2_SEED);
+        // Share the DFT result cache so cloned instances (DFT and GpuMmcs)
+        // can communicate GPU buffer availability.
+        new.dft_result_cache = Arc::clone(&self.dft_result_cache);
+        new
     }
 }
 
@@ -343,6 +383,7 @@ impl MetalBabyBearDft {
             twiddle_bufs: Mutex::new(HashMap::new()),
             temp_buf_cache: Mutex::new(None),
             data_buf_cache: Mutex::new(None),
+            dft_result_cache: Arc::new(Mutex::new(None)),
             poseidon2_hash_leaves_ps,
             poseidon2_compress_ps,
             poseidon2_rc_buf,
@@ -437,87 +478,421 @@ impl MetalBabyBearDft {
     }
 
     /// Build a full Merkle tree on GPU from leaf data.
-    /// Returns (leaf_digests, all_layers) where each layer is a vec of 8-element digests.
+    /// Build the full Merkle tree on GPU in a single command buffer.
+    /// Returns all digest layers (layer 0 = leaf hashes, last = root).
     pub fn gpu_merkle_tree(
         &self,
         data_buf: &metal::BufferRef,
         num_leaves: u32,
         leaf_width: u32,
     ) -> Vec<Vec<u32>> {
-        let opts = MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
-        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
-            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
-        };
-
-        let digest_elems = 8u32;
-        let mut layers: Vec<Buffer> = Vec::new();
-
-        // Layer 0: hash leaves
-        let leaf_digest_buf = self.device.new_buffer(
-            (num_leaves as u64) * (digest_elems as u64) * (size_of::<u32>() as u64), opts,
-        );
-        autoreleasepool(|| {
+        let layers = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.poseidon2_hash_leaves_ps);
-            enc.set_buffer(0, Some(data_buf), 0);
-            enc.set_buffer(1, Some(&leaf_digest_buf), 0);
-            enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
-            set_u32(&enc, 3, num_leaves);
-            set_u32(&enc, 4, leaf_width);
-            let max_tg = self.poseidon2_hash_leaves_ps.max_total_threads_per_threadgroup() as u64;
-            enc.dispatch_threads(
-                MTLSize { width: num_leaves as u64, height: 1, depth: 1 },
-                MTLSize { width: max_tg.min(256), height: 1, depth: 1 },
-            );
+            let layers = self.encode_merkle_tree(&enc, data_buf, num_leaves, leaf_width);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            layers
         });
-        layers.push(leaf_digest_buf);
 
-        // Compress layers until we have 1 digest (root)
+        layers
+            .iter()
+            .map(|buf| {
+                let count = buf.length() as usize / size_of::<u32>();
+                let mut v = vec![0u32; count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.contents() as *const u32,
+                        v.as_mut_ptr(),
+                        count,
+                    );
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Encode Poseidon2 Merkle tree dispatches into an existing encoder.
+    /// Returns the pre-allocated layer buffers (caller must wait on the
+    /// command buffer before reading them).
+    fn encode_merkle_tree(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data_buf: &metal::BufferRef,
+        num_leaves: u32,
+        leaf_width: u32,
+    ) -> Vec<Buffer> {
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let digest_elems = 8u32;
+
+        let mut layers: Vec<Buffer> = Vec::new();
+        let leaf_buf = self.device.new_buffer(
+            u64::from(num_leaves) * u64::from(digest_elems) * (size_of::<u32>() as u64),
+            opts,
+        );
+        layers.push(leaf_buf);
+
         let mut current_count = num_leaves;
         while current_count > 1 {
             let pairs = current_count / 2;
-            let parent_buf = self.device.new_buffer(
-                (pairs as u64) * (digest_elems as u64) * (size_of::<u32>() as u64), opts,
-            );
-            let child_buf = layers.last().unwrap();
-            autoreleasepool(|| {
-                let cmd = self.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
-                enc.set_buffer(0, Some(child_buf), 0);
-                enc.set_buffer(1, Some(&parent_buf), 0);
-                enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
-                set_u32(&enc, 3, pairs);
-                let max_tg = self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
-                enc.dispatch_threads(
-                    MTLSize { width: pairs as u64, height: 1, depth: 1 },
-                    MTLSize { width: max_tg.min(256), height: 1, depth: 1 },
-                );
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-            });
-            layers.push(parent_buf);
+            layers.push(self.device.new_buffer(
+                u64::from(pairs) * u64::from(digest_elems) * (size_of::<u32>() as u64),
+                opts,
+            ));
             current_count = pairs;
         }
 
-        // Read back all layers as u32 vecs
-        layers.iter().map(|buf| {
-            let count = buf.length() as usize / size_of::<u32>();
-            let mut v = vec![0u32; count];
+        // Leaf hashing
+        let max_tg_leaves =
+            self.poseidon2_hash_leaves_ps.max_total_threads_per_threadgroup() as u64;
+        enc.set_compute_pipeline_state(&self.poseidon2_hash_leaves_ps);
+        enc.set_buffer(0, Some(data_buf), 0);
+        enc.set_buffer(1, Some(&layers[0]), 0);
+        enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
+        set_u32(enc, 3, num_leaves);
+        set_u32(enc, 4, leaf_width);
+        enc.dispatch_threads(
+            MTLSize { width: num_leaves as u64, height: 1, depth: 1 },
+            MTLSize { width: max_tg_leaves.min(256), height: 1, depth: 1 },
+        );
+
+        // Compression layers
+        let max_tg_compress =
+            self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
+        current_count = num_leaves;
+        for layer_idx in 1..layers.len() {
+            let pairs = current_count / 2;
+            enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
+            enc.set_buffer(0, Some(&layers[layer_idx - 1]), 0);
+            enc.set_buffer(1, Some(&layers[layer_idx]), 0);
+            enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
+            set_u32(enc, 3, pairs);
+            enc.dispatch_threads(
+                MTLSize { width: pairs as u64, height: 1, depth: 1 },
+                MTLSize { width: max_tg_compress.min(256), height: 1, depth: 1 },
+            );
+            current_count = pairs;
+        }
+
+        layers
+    }
+
+    /// Convert GPU layer buffers into the digest_layers / cap format.
+    fn read_merkle_layers(layers: &[Buffer]) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        Vec<Vec<[BabyBear; 8]>>,
+        Vec<usize>,
+    ) {
+        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers
+            .iter()
+            .map(|buf| {
+                let count = buf.length() as usize / size_of::<u32>();
+                let mut v = vec![0u32; count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.contents() as *const u32,
+                        v.as_mut_ptr(),
+                        count,
+                    );
+                }
+                v.chunks_exact(8)
+                    .map(|chunk| {
+                        let mut digest = [BabyBear::ZERO; 8];
+                        for (i, &val) in chunk.iter().enumerate() {
+                            digest[i] = unsafe { std::mem::transmute::<u32, BabyBear>(val) };
+                        }
+                        digest
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let num_layers = digest_layers.len();
+        let arity_schedule = vec![2usize; num_layers.saturating_sub(1)];
+        let root_digest = digest_layers.last().unwrap()[0];
+        let cap = p3_symmetric::MerkleCap::new(vec![root_digest]);
+        (cap, digest_layers, arity_schedule)
+    }
+
+    /// Fused DFT + Merkle tree: runs NTT and Poseidon2 hashing in a single
+    /// GPU command buffer, avoiding the CPU round-trip between them.
+    /// Returns `(cap, digest_layers, arity_schedule, output_values)`.
+    pub fn gpu_dft_and_merkle(
+        &self,
+        values: &mut Vec<BabyBear>,
+        height: usize,
+        width: usize,
+    ) -> Option<(
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        Vec<Vec<[BabyBear; 8]>>,
+        Vec<usize>,
+    )> {
+        let log_n = log2_strict_usize(height) as u32;
+        if log_n < self.gpu_min_log_n {
+            return None;
+        }
+        let total_bytes_val = height * width * size_of::<u32>();
+        if total_bytes_val < 64 * 1024 * 1024 {
+            return None;
+        }
+
+        let total_bytes = (height * width * size_of::<u32>()) as u64;
+        let tw = self.twiddle_buffer(log_n);
+
+        // Managed buffer for DIF stages (fast GPU memory).
+        let dif_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
+        // Managed buffer for bitrev'd output (natural order, stays on GPU for Merkle).
+        let natural_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
+
+        // Try zero-copy input: wrap values directly as Metal buffer.
+        let zc_input = self.try_zero_copy_buffer(values, total_bytes);
+
+        let result = autoreleasepool(|| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+
+            if let Some(ref zc_buf) = zc_input {
+                // First R16 OOP: zc_buf → dif_buf
+                // Remaining DIF stages: in-place on dif_buf
+                // All dispatches without the final bitrev (we handle it ourselves)
+                self.encode_dif_stages_inplace(&enc, zc_buf, &dif_buf, &tw,
+                    log_n, height as u32, width as u32);
+            } else {
+                // CPU memcpy into managed buffer, DIF in-place
+                unsafe {
+                    fast_memcpy(
+                        dif_buf.contents() as *mut u8,
+                        values.as_ptr().cast::<u8>(),
+                        total_bytes as usize,
+                    );
+                }
+                self.encode_dif_stages_only(&enc, &dif_buf, &tw,
+                    log_n, height as u32, width as u32);
+            }
+
+            // Bitrev gather: dif_buf → natural_buf (managed→managed, fast)
+            self.encode_bitrev_gather(&enc, &dif_buf, &natural_buf,
+                height as u32, width as u32, log_n);
+
+            // Merkle tree: hash natural_buf rows, compress all layers
+            let merkle_layers = self.encode_merkle_tree(
+                &enc, &natural_buf, height as u32, width as u32,
+            );
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if cmd.status() == MTLCommandBufferStatus::Error {
+                return None;
+            }
+
+            // Copy DFT result back to CPU (read from natural_buf)
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.contents() as *const u32,
-                    v.as_mut_ptr(),
-                    count,
+                fast_memcpy_from_gpu(
+                    values.as_mut_ptr().cast::<u8>(),
+                    natural_buf.contents() as *const u8,
+                    total_bytes as usize,
                 );
             }
-            v
-        }).collect()
+
+            Some(Self::read_merkle_layers(&merkle_layers))
+        });
+
+        Self::release_buf(&self.data_buf_cache, dif_buf);
+        Self::release_buf(&self.temp_buf_cache, natural_buf);
+        result
+    }
+
+    /// Encode just the DIF butterfly stages (no bitrev) with zero-copy input.
+    /// First R16 is out-of-place (zc→managed), remaining stages in-place on managed.
+    fn encode_dif_stages_inplace(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        zc_buf: &metal::BufferRef,
+        data: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let tg_w = width.min(32);
+        let mut dif_stage = 0u32;
+        let mut first_dispatch = true;
+
+        while dif_stage < log_n {
+            let gap = log_n - dif_stage;
+            if gap >= 4 {
+                let num_units = height >> 4;
+                if first_dispatch {
+                    let max_tg = self.dif_r16_oop_ps.max_total_threads_per_threadgroup() as u32;
+                    enc.set_compute_pipeline_state(&self.dif_r16_oop_ps);
+                    enc.set_buffer(0, Some(zc_buf), 0);
+                    enc.set_buffer(1, Some(data), 0);
+                    enc.set_buffer(2, Some(twiddles), 0);
+                    set_u32(enc, 3, height);
+                    set_u32(enc, 4, width);
+                    set_u32(enc, 5, dif_stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                    first_dispatch = false;
+                } else {
+                    let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
+                    enc.set_compute_pipeline_state(&self.dif_r16_ps);
+                    enc.set_buffer(0, Some(data), 0);
+                    enc.set_buffer(1, Some(twiddles), 0);
+                    set_u32(enc, 2, height);
+                    set_u32(enc, 3, width);
+                    set_u32(enc, 4, dif_stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                }
+                dif_stage += 4;
+            } else if gap >= 3 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r8_ps, 3);
+                dif_stage += 3;
+            } else if gap == 2 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r4_ps, 2);
+                dif_stage += 2;
+            } else {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r2_ps, 1);
+                dif_stage += 1;
+            }
+        }
+    }
+
+    /// Encode DIF butterfly stages in-place on a managed buffer (no zero-copy input).
+    fn encode_dif_stages_only(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let tg_w = width.min(32);
+        let mut dif_stage = 0u32;
+
+        while dif_stage < log_n {
+            let gap = log_n - dif_stage;
+            if gap >= 4 {
+                let num_units = height >> 4;
+                let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r16_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 4;
+            } else if gap >= 3 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r8_ps, 3);
+                dif_stage += 3;
+            } else if gap == 2 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r4_ps, 2);
+                dif_stage += 2;
+            } else {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r2_ps, 1);
+                dif_stage += 1;
+            }
+        }
+    }
+
+    /// Helper: dispatch a single in-place DIF radix stage.
+    fn dispatch_dif_inplace(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        dif_stage: u32,
+        tg_w: u32,
+        ps: &ComputePipelineState,
+        log_radix: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let num_units = height >> log_radix;
+        let max_tg = ps.max_total_threads_per_threadgroup() as u32;
+        enc.set_compute_pipeline_state(ps);
+        enc.set_buffer(0, Some(data), 0);
+        enc.set_buffer(1, Some(twiddles), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, dif_stage);
+        enc.dispatch_threads(
+            MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+            MTLSize {
+                width: tg_w as u64,
+                height: (max_tg / tg_w).min(num_units) as u64,
+                depth: 1,
+            },
+        );
+    }
+
+    /// Encode a bitrev gather: src[bitrev(row)] → dst[row] (coalesced writes).
+    fn encode_bitrev_gather(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &metal::BufferRef,
+        dst: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        log_n: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let tg_w = width.min(32);
+        let max_tg = self.bitrev_gather_ps.max_total_threads_per_threadgroup() as u32;
+        enc.set_compute_pipeline_state(&self.bitrev_gather_ps);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, log_n);
+        enc.dispatch_threads(
+            MTLSize { width: width as u64, height: height as u64, depth: 1 },
+            MTLSize {
+                width: tg_w as u64,
+                height: (max_tg / tg_w).min(height) as u64,
+                depth: 1,
+            },
+        );
     }
 
     /// Build Merkle digest layers on GPU from a raw BabyBear slice.
@@ -533,7 +908,6 @@ impl MetalBabyBearDft {
         Vec<usize>,
     ) {
         let total_bytes = (height * width * size_of::<u32>()) as u64;
-
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache
             | MTLResourceOptions::StorageModeShared;
         let data_buf = self.device.new_buffer_with_data(
@@ -542,31 +916,19 @@ impl MetalBabyBearDft {
             opts,
         );
 
-        let raw_layers = self.gpu_merkle_tree(&data_buf, height as u32, width as u32);
+        let layers = autoreleasepool(|| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            let layers = self.encode_merkle_tree(
+                &enc, &data_buf, height as u32, width as u32,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            layers
+        });
 
-        let digest_layers: Vec<Vec<[BabyBear; 8]>> = raw_layers
-            .iter()
-            .map(|layer_u32| {
-                layer_u32
-                    .chunks_exact(8)
-                    .map(|chunk| {
-                        let mut digest = [BabyBear::ZERO; 8];
-                        for (i, &v) in chunk.iter().enumerate() {
-                            digest[i] = unsafe { std::mem::transmute::<u32, BabyBear>(v) };
-                        }
-                        digest
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let num_layers = digest_layers.len();
-        let arity_schedule = vec![2usize; num_layers.saturating_sub(1)];
-
-        let root_digest = digest_layers.last().unwrap()[0];
-        let cap = p3_symmetric::MerkleCap::new(vec![root_digest]);
-
-        (cap, digest_layers, arity_schedule)
+        Self::read_merkle_layers(&layers)
     }
 
     /// Build Merkle digest layers on GPU from a row-major matrix.
@@ -623,16 +985,12 @@ impl MetalBabyBearDft {
         if log_n < self.gpu_min_log_n {
             return None;
         }
-        // GPU wins on Apple Silicon unified memory when total data >= 64MB.
-        // Below that, dispatch overhead and cache coherency costs exceed compute savings.
-        // Benchmarked crossover: 16x64 (16MB) GPU 50% slower, 18x64 (64MB) GPU 20% faster.
         let total_bytes_val = height * width * size_of::<u32>();
         if total_bytes_val < 64 * 1024 * 1024 {
             return None;
         }
 
-        let total = height * width;
-        let total_bytes = (total * size_of::<u32>()) as u64;
+        let total_bytes = (height * width * size_of::<u32>()) as u64;
         let tw = self.twiddle_buffer(log_n);
 
         // Best path: zero-copy wrap values for both input AND output.
@@ -1533,7 +1891,7 @@ impl TwoAdicSubgroupDft<BabyBear> for MetalBabyBearDft {
     }
 }
 
-use p3_commit::{BatchOpening, BatchOpeningRef, Mmcs};
+use p3_commit::{BatchOpening, BatchOpeningRef};
 use p3_field::PackedValue;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
@@ -1572,6 +1930,72 @@ impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
         gpu: MetalBabyBearDft,
     ) -> Self {
         Self { inner, gpu }
+    }
+
+}
+
+impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
+    /// Fused DFT + Merkle commit in a single GPU command buffer.
+    /// Runs NTT, bitrev, Poseidon2 leaf hashing, and all compression layers
+    /// without any CPU round-trip between DFT and Merkle.
+    pub fn dft_and_commit_matrix(
+        &self,
+        mut mat: RowMajorMatrix<BabyBear>,
+    ) -> Option<(
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
+    )> {
+        let height = mat.height();
+        let width = mat.width();
+
+        let (cap, digest_layers, arity_schedule) =
+            self.gpu.gpu_dft_and_merkle(&mut mat.values, height, width)?;
+
+        let tree = p3_merkle_tree::MerkleTree::from_parts(
+            vec![mat],
+            digest_layers,
+            arity_schedule,
+        );
+
+        Some((cap, tree))
+    }
+
+    /// Fused extension-field DFT + Merkle commit.
+    pub fn dft_algebra_and_commit_matrix<EF>(
+        &self,
+        mat: RowMajorMatrix<EF>,
+    ) -> Option<(
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_merkle_tree::MerkleTree<
+            BabyBear,
+            BabyBear,
+            p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>,
+            2,
+            8,
+        >,
+    )>
+    where
+        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+    {
+        let init_width = mat.width();
+        let height = mat.height();
+        let mut base_values = EF::flatten_to_base(mat.values);
+        let base_width = init_width * EF::DIMENSION;
+
+        let (cap, digest_layers, arity_schedule) =
+            self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width)?;
+
+        let ef_values = EF::reconstitute_from_base(base_values);
+        let ef_mat = RowMajorMatrix::new(ef_values, init_width);
+        let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
+
+        let tree = p3_merkle_tree::MerkleTree::from_parts(
+            vec![flat_view],
+            digest_layers,
+            arity_schedule,
+        );
+
+        Some((cap, tree))
     }
 }
 
@@ -1676,6 +2100,86 @@ where
         self.inner.verify_batch(commit, dimensions, index, inner_ref)
     }
 }
+
+impl<P, PW, H, C> DftCommitFusion<BabyBear> for GpuMmcs<P, PW, H, C, 2, 8>
+where
+    P: PackedValue<Value = BabyBear>,
+    PW: PackedValue<Value = BabyBear>,
+    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+        + CryptographicHasher<P, [PW; 8]>
+        + Sync,
+    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+        + PseudoCompressionFunction<[PW; 8], 2>
+        + Sync,
+{
+    fn dft_and_commit(
+        &self,
+        mut mat: RowMajorMatrix<BabyBear>,
+    ) -> Result<
+        (Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>),
+        RowMajorMatrix<BabyBear>,
+    > {
+        let height = mat.height();
+        let width = mat.width();
+        match self.gpu.gpu_dft_and_merkle(&mut mat.values, height, width) {
+            Some((cap, digest_layers, arity_schedule)) => {
+                let tree = p3_merkle_tree::MerkleTree::from_parts(
+                    vec![mat], digest_layers, arity_schedule,
+                );
+                Ok((cap, tree))
+            }
+            None => Err(mat),
+        }
+    }
+
+    fn dft_algebra_and_commit<EF>(
+        &self,
+        mat: RowMajorMatrix<EF>,
+    ) -> Result<
+        (
+            Self::Commitment,
+            Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+        ),
+        RowMajorMatrix<EF>,
+    >
+    where
+        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+    {
+        let init_width = mat.width();
+        let height = mat.height();
+        let mut base_values = EF::flatten_to_base(mat.values);
+        let base_width = init_width * EF::DIMENSION;
+
+        match self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width) {
+            Some((cap, digest_layers, arity_schedule)) => {
+                let ef_values = EF::reconstitute_from_base(base_values);
+                let ef_mat = RowMajorMatrix::new(ef_values, init_width);
+                let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
+                let tree = p3_merkle_tree::MerkleTree::from_parts(
+                    vec![flat_view], digest_layers, arity_schedule,
+                );
+                Ok((cap, tree))
+            }
+            None => {
+                let ef_values = EF::reconstitute_from_base(base_values);
+                Err(RowMajorMatrix::new(ef_values, init_width))
+            }
+        }
+    }
+}
+
+/// No-op fusion for CPU-only MerkleTreeMmcs.
+impl<P, PW, H, C> DftCommitFusion<BabyBear> for MerkleTreeMmcs<P, PW, H, C, 2, 8>
+where
+    P: PackedValue<Value = BabyBear>,
+    PW: PackedValue<Value = BabyBear>,
+    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+        + CryptographicHasher<P, [PW; 8]>
+        + Sync,
+    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+        + PseudoCompressionFunction<[PW; 8], 2>
+        + Sync,
+{}
 
 #[cfg(test)]
 mod tests {

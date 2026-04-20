@@ -42,15 +42,6 @@ where
         Self(params)
     }
 
-    /// Commits a polynomial using a Merkle-based commitment scheme.
-    ///
-    /// This function:
-    /// - Expands polynomial coefficients to evaluations.
-    /// - Applies folding and restructuring optimizations.
-    /// - Converts evaluations to an extension field.
-    /// - Constructs a Merkle tree from the evaluations.
-    /// - Computes out-of-domain (OOD) challenge points and their evaluations.
-    /// - Returns a `Witness` containing the commitment data.
     #[instrument(skip_all)]
     pub fn commit<Dft>(
         &self,
@@ -63,9 +54,6 @@ where
         Dft: TwoAdicSubgroupDft<F>,
         Challenger: CanObserve<MT::Commitment>,
     {
-        // Transpose for reverse variable order
-        // And then pad with zeros
-
         let padded = info_span!("transpose & pad").in_scope(|| {
             let num_vars = statement.num_variables();
             let mut mat = RowMajorMatrixView::new(
@@ -80,7 +68,6 @@ where
             mat
         });
 
-        // Perform DFT on the padded evaluations matrix
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
             .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
 
@@ -88,12 +75,9 @@ where
             info_span!("commit_matrix").in_scope(|| self.mmcs.commit_matrix(folded_matrix));
 
         proof.initial_commitment = Some(root.clone());
-        // Use CanObserve<Hash<F, W, N>> which both DuplexChallenger and SerializingChallenger implement
         challenger.observe(root);
 
-        // TODO: consider moving ood sampling to whir::Prover::prove
         (0..self.0.commitment_ood_samples).for_each(|_| {
-            // Generate OOD points from ProverState randomness
             let point = Point::expand_from_univariate(
                 challenger.sample_algebra_element(),
                 self.num_variables,
@@ -103,7 +87,72 @@ where
             challenger.observe_algebra_element(eval);
         });
 
-        // Return the prover data
+        Ok(prover_data)
+    }
+}
+
+/// Fused DFT+Merkle commit path for MMCS types that support `DftCommitFusion`.
+#[cfg(feature = "gpu-metal")]
+impl<'a, EF, F, MT, Challenger> CommitmentWriter<'a, EF, F, MT, Challenger>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    MT: crate::gpu_dft::DftCommitFusion<F>,
+{
+    /// Like `commit`, but attempts to fuse DFT and Merkle tree construction
+    /// in a single GPU command buffer. Falls back to separate DFT + commit
+    /// if the MMCS doesn't support fusion or the matrix is too small.
+    #[instrument(skip_all)]
+    pub fn commit_fused<Dft>(
+        &self,
+        dft: &Dft,
+        proof: &mut WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        statement: &mut InitialStatement<F, EF>,
+    ) -> Result<MT::ProverData<DenseMatrix<F>>, FiatShamirError>
+    where
+        Dft: TwoAdicSubgroupDft<F>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let padded = info_span!("transpose & pad").in_scope(|| {
+            let num_vars = statement.num_variables();
+            let mut mat = RowMajorMatrixView::new(
+                statement.poly.as_slice(),
+                1 << (num_vars - self.folding_factor.at_round(0)),
+            )
+            .transpose();
+            mat.pad_to_height(
+                1 << (num_vars + self.starting_log_inv_rate - self.folding_factor.at_round(0)),
+                F::ZERO,
+            );
+            mat
+        });
+
+        let (root, prover_data) = match info_span!("fused_dft_commit")
+            .in_scope(|| self.mmcs.dft_and_commit(padded))
+        {
+            Ok((root, tree)) => (root, tree),
+            Err(padded) => {
+                let folded = info_span!("dft", height = padded.height(), width = padded.width())
+                    .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
+                info_span!("commit_matrix").in_scope(|| self.mmcs.commit_matrix(folded))
+            }
+        };
+
+        proof.initial_commitment = Some(root.clone());
+        challenger.observe(root);
+
+        (0..self.0.commitment_ood_samples).for_each(|_| {
+            let point = Point::expand_from_univariate(
+                challenger.sample_algebra_element(),
+                self.num_variables,
+            );
+            let eval = info_span!("ood evaluation").in_scope(|| statement.evaluate(&point));
+            proof.initial_ood_answers.push(eval);
+            challenger.observe_algebra_element(eval);
+        });
+
         Ok(prover_data)
     }
 }
