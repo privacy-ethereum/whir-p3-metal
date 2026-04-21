@@ -230,6 +230,66 @@ fn benchmark_dft_plus_merkle(c: &mut Criterion) {
     group.finish();
 }
 
+fn make_whir_config_params(
+    num_variables: usize,
+    folding_factor: usize,
+    starting_log_inv_rate: usize,
+) -> (
+    WhirConfig<EF, F, MyMmcs, MyChallenger>,
+    ProtocolParameters<MyMmcs>,
+    Perm,
+) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let perm = Perm::new_from_rng_128(&mut rng);
+    let merkle_hash = MyHash::new(perm.clone());
+    let merkle_compress = MyCompress::new(perm.clone());
+    let mmcs = MyMmcs::new(merkle_hash, merkle_compress, 0);
+
+    let whir_params = ProtocolParameters {
+        security_level: 100,
+        pow_bits: DEFAULT_MAX_POW,
+        folding_factor: FoldingFactor::Constant(folding_factor),
+        mmcs,
+        soundness_type: SecurityAssumption::CapacityBound,
+        starting_log_inv_rate,
+        rs_domain_initial_reduction_factor: 3,
+    };
+
+    let params = WhirConfig::new(num_variables, whir_params.clone());
+    (params, whir_params, perm)
+}
+
+fn make_gpu_whir_config_params(
+    num_variables: usize,
+    folding_factor: usize,
+    starting_log_inv_rate: usize,
+    gpu: MetalBabyBearDft,
+) -> (
+    WhirConfig<EF, F, MyGpuMmcs, MyChallenger>,
+    ProtocolParameters<MyGpuMmcs>,
+    Perm,
+) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let perm = Perm::new_from_rng_128(&mut rng);
+    let merkle_hash = MyHash::new(perm.clone());
+    let merkle_compress = MyCompress::new(perm.clone());
+    let inner_mmcs = MyMmcs::new(merkle_hash, merkle_compress, 0);
+    let mmcs = MyGpuMmcs::new(inner_mmcs, gpu);
+
+    let whir_params = ProtocolParameters {
+        security_level: 100,
+        pow_bits: DEFAULT_MAX_POW,
+        folding_factor: FoldingFactor::Constant(folding_factor),
+        mmcs,
+        soundness_type: SecurityAssumption::CapacityBound,
+        starting_log_inv_rate,
+        rs_domain_initial_reduction_factor: 3,
+    };
+
+    let params = WhirConfig::new(num_variables, whir_params.clone());
+    (params, whir_params, perm)
+}
+
 fn benchmark_whir_prove(c: &mut Criterion) {
     let num_variables = 24;
     let (params, whir_params, perm) = make_whir_config(num_variables);
@@ -284,7 +344,6 @@ fn benchmark_whir_prove(c: &mut Criterion) {
         });
     });
 
-    // GPU DFT + GPU Merkle (full GPU pipeline)
     {
         let dft = MetalBabyBearDft::new(max_fft);
         let (gpu_params, gpu_whir_params, _) =
@@ -316,9 +375,123 @@ fn benchmark_whir_prove(c: &mut Criterion) {
     }
 }
 
+fn benchmark_whir_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("whir_sweep");
+
+    let configs: Vec<(usize, usize, usize)> = vec![
+        // n=22: medium polynomial, bigger folding & rates
+        (22, 4, 1), (22, 4, 2), (22, 4, 3), (22, 4, 4),
+        (22, 5, 1), (22, 5, 2), (22, 5, 3), (22, 5, 4), (22, 5, 5),
+        (22, 6, 1), (22, 6, 2), (22, 6, 3), (22, 6, 4), (22, 6, 5), (22, 6, 6),
+        (22, 7, 1), (22, 7, 2), (22, 7, 3), (22, 7, 4), (22, 7, 5),
+        (22, 8, 1), (22, 8, 2), (22, 8, 3), (22, 8, 4), (22, 8, 5),
+        // n=24: large polynomial, bigger folding & rates
+        (24, 4, 1), (24, 4, 2), (24, 4, 3), (24, 4, 4),
+        (24, 5, 1), (24, 5, 2), (24, 5, 3), (24, 5, 4), (24, 5, 5),
+        (24, 6, 1), (24, 6, 2), (24, 6, 3), (24, 6, 4), (24, 6, 5), (24, 6, 6),
+        (24, 7, 1), (24, 7, 2), (24, 7, 3), (24, 7, 4), (24, 7, 5),
+        (24, 8, 1), (24, 8, 2), (24, 8, 3), (24, 8, 4), (24, 8, 5),
+    ];
+    for &(num_variables, folding, log_inv_rate) in &configs {
+                let label = format!("n{num_variables}_f{folding}_r{log_inv_rate}");
+
+                let cpu_config = std::panic::catch_unwind(|| {
+                    make_whir_config_params(num_variables, folding, log_inv_rate)
+                });
+                let (params, whir_params, perm) = match cpu_config {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let num_coeffs = 1usize << num_variables;
+                let mut rng = SmallRng::seed_from_u64(0);
+                let polynomial =
+                    Poly::<F>::new((0..num_coeffs).map(|_| rng.random()).collect());
+                let mut initial_statement =
+                    params.initial_statement(polynomial, SumcheckStrategy::Svo);
+                let _ = initial_statement.evaluate(&Point::rand(&mut rng, num_variables));
+
+                let mut domainsep = DomainSeparator::new(vec![]);
+                domainsep.commit_statement::<_, _, 8>(&params);
+                domainsep.add_whir_proof::<_, _, 8>(&params);
+
+                let max_fft = 1 << params.max_fft_size();
+
+                // CPU
+                {
+                    let dft = Radix2DFTSmallBatch::<F>::new(max_fft);
+                    group.bench_function(&format!("cpu_{label}"), |b| {
+                        b.iter(|| {
+                            let mut challenger = MyChallenger::new(perm.clone());
+                            domainsep.observe_domain_separator(&mut challenger);
+                            let mut proof = WhirProof::<F, EF, MyMmcs>::from_protocol_parameters(
+                                &whir_params,
+                                num_variables,
+                            );
+                            let committer = CommitmentWriter::new(&params);
+                            let mut stmt = initial_statement.clone();
+                            let pd = committer
+                                .commit(&dft, &mut proof, &mut challenger, &mut stmt)
+                                .unwrap();
+                            let prover = Prover(&params);
+                            prover
+                                .prove(&dft, &mut proof, &mut challenger, &stmt, pd)
+                                .unwrap();
+                        });
+                    });
+                }
+
+                // GPU fused
+                {
+                    let dft = MetalBabyBearDft::new(max_fft);
+                    let gpu_config = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            make_gpu_whir_config_params(
+                                num_variables,
+                                folding,
+                                log_inv_rate,
+                                dft.clone(),
+                            )
+                        }),
+                    );
+                    let (gpu_params, gpu_whir_params, _) = match gpu_config {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let mut gpu_ds = DomainSeparator::new(vec![]);
+                    gpu_ds.commit_statement::<_, _, 8>(&gpu_params);
+                    gpu_ds.add_whir_proof::<_, _, 8>(&gpu_params);
+
+                    group.bench_function(&format!("gpu_{label}"), |b| {
+                        b.iter(|| {
+                            let mut challenger = MyChallenger::new(perm.clone());
+                            gpu_ds.observe_domain_separator(&mut challenger);
+                            let mut proof =
+                                WhirProof::<F, EF, MyGpuMmcs>::from_protocol_parameters(
+                                    &gpu_whir_params,
+                                    num_variables,
+                                );
+                            let committer = CommitmentWriter::new(&gpu_params);
+                            let mut stmt = initial_statement.clone();
+                            let pd = committer
+                                .commit_fused(&dft, &mut proof, &mut challenger, &mut stmt)
+                                .unwrap();
+                            let prover = Prover(&gpu_params);
+                            prover
+                                .prove(&dft, &mut proof, &mut challenger, &stmt, pd)
+                                .unwrap();
+                        });
+                    });
+                }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = benchmark_raw_dft, benchmark_algebra_dft, benchmark_merkle, benchmark_dft_plus_merkle, benchmark_whir_prove
+    targets = benchmark_raw_dft, benchmark_algebra_dft, benchmark_merkle, benchmark_dft_plus_merkle, benchmark_whir_prove, benchmark_whir_sweep
 );
 criterion_main!(benches);

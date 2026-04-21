@@ -69,17 +69,59 @@ mapping efficiently to Apple GPU's ALU.
 
 ### Benchmarks
 
-On Apple M-series silicon, `whir_prove` (num_variables=22):
+All benchmarks on Apple M-series silicon (unified memory). Parameters:
+- `n` = `num_variables` (polynomial has 2^n coefficients)
+- `fold` = `folding_factor` (each STIR round folds 2^fold evaluations)
+- `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate, domain = 2^(n+rate) points)
+- Speedup = CPU time / GPU time
 
-| Configuration | Time | vs CPU |
-|---|---|---|
-| CPU only | ~960 ms | baseline |
-| GPU DFT only | ~1010 ms | ~5% slower (Merkle still on CPU) |
-| GPU DFT + GPU Merkle | ~910 ms | ~5% faster |
-| GPU DFT + Merkle fused | **~800 ms** | **~15-18% faster** |
+#### Parameter sweep — n=22 (4M coefficients)
 
-Run benchmarks:
+| fold | rate | CPU (ms) | GPU (ms) | Speedup |
+|------|------|----------|----------|---------|
+| 4 | 1 | 182 | 201 | 0.91x |
+| 4 | 2 | 385 | 284 | **1.35x** |
+| 4 | 3 | 818 | 579 | **1.41x** |
+| **6** | **1** | **265** | **142** | **1.87x** |
+| **6** | **2** | **911** | **491** | **1.86x** |
+| 8 | 1 | 125 | 98 | **1.28x** |
+| 8 | 2 | 210 | 135 | **1.55x** |
+| 8 | 3 | 405 | 327 | **1.24x** |
+| 10 | 1 | 140 | 112 | **1.26x** |
+| 10 | 3 | 1696 | 1500 | **1.13x** |
+
+#### Parameter sweep — n=24 (16M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | Speedup |
+|------|------|----------|----------|---------|
+| 4 | 1 | 982 | 921 | **1.07x** |
+| 4 | 2 | 5034 | 3651 | **1.38x** |
+| 6 | 1 | 579 | 488 | **1.19x** |
+| 6 | 2 | 2221 | 2005 | **1.11x** |
+| 6 | 3 | 11844 | 8539 | **1.39x** |
+| 7 | 1 | 2438 | 2070 | **1.18x** |
+| 8 | 1 | 40070 | 35668 | **1.12x** |
+
+#### Observations
+
+- **Best GPU speedup: fold=6 at rate 1-2** — consistently 1.8-1.9x for n=22.
+  Fold=6 produces moderately large DFTs (2^16-2^18 rows) that fully saturate
+  GPU parallelism while keeping the number of STIR rounds manageable.
+- **Higher rates amplify GPU advantage** (larger domain → more GPU-friendly
+  work), but rates above 3 make both CPU and GPU very slow.
+- **GPU loses when data < 64 MB** — the fused pipeline skips GPU and falls
+  back to CPU automatically (see threshold in `gpu_dft_and_merkle`).
+- **Folding factors ≥ 12 are untested on GPU** — they trigger Metal driver
+  instability (kernel panics) on some Apple Silicon configurations.
+- The GPU pipeline is most beneficial when the initial commit DFT processes
+  2^16 to 2^21 rows with total data between 64 MB and 256 MB.
+
+#### Running benchmarks
 
 ```bash
+# Full whir_prove benchmark (default config: n=24, fold=4, rate=1)
 cargo bench --features gpu-metal --bench dft_gpu -- "whir_prove"
+
+# Parameter sweep (writes results to sweep_results.txt)
+cargo run --release --features gpu-metal --bin sweep
 ```
