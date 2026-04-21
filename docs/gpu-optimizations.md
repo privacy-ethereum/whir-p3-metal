@@ -5,11 +5,13 @@ explains the technique, and shows benchmark results. All measurements
 are on Apple M-series silicon (unified memory) using the `sweep` binary.
 
 **Columns:**
+
 - **CPU** — pure CPU prover (Radix-2 DFT + CPU Poseidon2 Merkle)
 - **GPU** — GPU-accelerated with commit-only fusion (initial commit fused, rounds separate)
 - **Fused** — GPU-accelerated with full fusion (initial commit + per-round DFT+Merkle fused)
 
 **Parameters:**
+
 - `n` = `num_variables` (polynomial has 2^n coefficients)
 - `fold` = `folding_factor` (each STIR round folds 2^fold evaluations)
 - `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate, domain = 2^(n+rate) points)
@@ -37,9 +39,10 @@ polynomial of 2^n coefficients over a multiplicative subgroup.
 ```
 
 **Key design decisions:**
+
 - BabyBear field arithmetic in **Montgomery form** throughout — the
-  Montgomery multiply uses only 32-bit `mul`/`mulhi` (no 64-bit), mapping
-  well to Apple GPU ALU.
+Montgomery multiply uses only 32-bit `mul`/`mulhi` (no 64-bit), mapping
+well to Apple GPU ALU.
 - Precomputed twiddle factor table in a shared Metal buffer.
 - Bit-reversal as a separate kernel with coalesced writes.
 
@@ -117,14 +120,15 @@ entirely in Metal, and uses it to build Merkle trees on GPU.
 ```
 
 **Two Metal kernels:**
+
 - `poseidon2_hash_leaves`: one thread per row, absorbs `leaf_width`
-  elements in chunks of 8 via Poseidon2 sponge.
+elements in chunks of 8 via Poseidon2 sponge.
 - `poseidon2_merkle_compress`: one thread per pair, 2-to-1 compression.
 
 All layers are dispatched in a single command encoder — Metal guarantees
 dispatch ordering, so no explicit barriers needed.
 
-**`GpuMmcs` wrapper:** Implements Plonky3's `Mmcs` trait, automatically
+`**GpuMmcs` wrapper:** Implements Plonky3's `Mmcs` trait, automatically
 choosing GPU vs CPU based on matrix size (threshold: 8 MB).
 
 ### Impact
@@ -256,6 +260,7 @@ and Merkle hashing reads from the same buffer.
 ```
 
 This eliminates:
+
 - The separate `natural_buf` GPU buffer allocation
 - The full-matrix nontemporal memcpy after GPU completion
 
@@ -295,30 +300,34 @@ the GPU can test millions of nonces in parallel.
 ```
 
 **Metal kernel (`poseidon2_pow_grind`):**
+
 - Takes the base Poseidon2 sponge state (16 elements in Montgomery form)
 - Each GPU thread substitutes its nonce at `witness_idx`, runs the full
-  Poseidon2 permutation, converts `state[7]` to canonical form, checks mask
+Poseidon2 permutation, converts `state[7]` to canonical form, checks mask
 - First winner atomically writes to shared `result`/`found` buffers
 
-**`GpuChallenger` wrapper:**
+`**GpuChallenger` wrapper:**
+
 - Wraps the standard `DuplexChallenger` and delegates all observe/sample ops
 - Overrides `GrindingChallenger::grind()` to extract the internal sponge state,
-  dispatch to GPU, and verify the result on CPU before updating challenger state
+dispatch to GPU, and verify the result on CPU before updating challenger state
 - Falls back to CPU grinding if GPU doesn't find a witness (never happens in
-  practice since nonce space covers all of BabyBear)
+practice since nonce space covers all of BabyBear)
 
 **Buffer caching optimization:**
+
 - Pre-allocates all Metal buffers at `MetalBabyBearDft` construction time
 - Each `gpu_pow_grind` call copies state into cached buffers (64 bytes) instead
-  of allocating new 4KB+ buffers per call
+of allocating new 4KB+ buffers per call
 - Eliminates per-call allocation overhead across the many grind calls per proof
 
 ### Key implementation details
 
 Montgomery form conversions were critical to get right:
+
 - `bb_from_canonical(x, R²)`: canonical → Montgomery via `mul(x, R²) mod P`
 - `bb_to_canonical(x)`: Montgomery → canonical via subtraction-based reduction
-  (equivalent to `mul(x, 1)`, matching the p3 implementation)
+(equivalent to `mul(x, 1)`, matching the p3 implementation)
 
 ### Impact
 
@@ -336,90 +345,98 @@ All measurements on Apple M-series silicon. Median of 3 runs.
 
 ### n=18 (256K coefficients)
 
-| fold | rate | CPU (ms) | Opt 1 | Opt 2 | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
-|------|------|----------|-------|-------|-------|-------|-------|-------|-------|
-| 1 | 1 | 108 | **1.08x** | **1.08x** | 0.96x | 0.90x | 0.80x | 0.77x | 0.68x |
-| 1 | 2 | 134 | 0.87x | 0.84x | 0.84x | 0.82x | 0.74x | 0.75x | 0.66x |
-| 1 | 3 | 243 | 0.85x | 0.85x | 0.88x | 0.92x | 0.85x | 0.89x | 0.99x |
-| 2 | 1 | 42 | 0.94x | 0.92x | 0.84x | 0.83x | 0.54x | 0.64x | 0.53x |
-| 2 | 2 | 61 | 0.86x | 0.77x | 0.84x | 0.85x | 0.71x | 0.74x | 0.61x |
-| 2 | 3 | 105 | 0.88x | 0.87x | 0.94x | 0.93x | 0.82x | 0.98x | 0.87x |
-| 3 | 1 | 22 | 0.94x | 0.85x | 0.79x | 0.81x | 0.57x | 0.57x | 0.44x |
-| 3 | 2 | 32 | 0.92x | 0.89x | 0.84x | 0.83x | 0.73x | 0.62x | 0.53x |
-| 3 | 3 | 48 | 0.78x | 0.79x | 0.78x | 0.80x | 0.74x | 0.61x | 0.62x |
-| 4 | 1 | 14 | 0.71x | 0.68x | 0.70x | 0.71x | 0.54x | 0.47x | 0.35x |
-| 4 | 2 | 23 | 0.77x | 0.79x | 0.85x | 0.86x | 0.67x | 0.68x | 0.50x |
-| 4 | 3 | 36 | 0.69x | 0.77x | 0.84x | 0.81x | 0.73x | 0.65x | 0.58x |
-| 6 | 1 | 10 | 0.65x | 0.59x | 0.72x | 0.68x | 0.59x | 0.58x | 0.36x |
-| 6 | 2 | 15 | 0.64x | 0.72x | 0.75x | 0.73x | 0.68x | 0.63x | 0.43x |
-| 6 | 3 | 27 | 0.61x | 0.80x | 0.89x | 0.90x | 0.82x | 0.83x | 0.61x |
-| 8 | 1 | 10 | 0.69x | 0.70x | 0.67x | 0.73x | 0.62x | 0.23x | 0.33x |
-| 8 | 2 | 18 | 0.70x | 0.90x | 0.87x | 0.89x | 0.83x | 0.62x | 0.43x |
-| 8 | 3 | 33 | 0.60x | 0.70x | 0.99x | 0.95x | 0.91x | 0.44x | 0.61x |
+
+| fold | rate | CPU (ms) | Opt 1     | Opt 2     | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
+| ---- | ---- | -------- | --------- | --------- | ----- | ----- | ----- | ----- | ----- |
+| 1    | 1    | 108      | **1.08x** | **1.08x** | 0.96x | 0.90x | 0.80x | 0.77x | 0.68x |
+| 1    | 2    | 134      | 0.87x     | 0.84x     | 0.84x | 0.82x | 0.74x | 0.75x | 0.66x |
+| 1    | 3    | 243      | 0.85x     | 0.85x     | 0.88x | 0.92x | 0.85x | 0.89x | 0.99x |
+| 2    | 1    | 42       | 0.94x     | 0.92x     | 0.84x | 0.83x | 0.54x | 0.64x | 0.53x |
+| 2    | 2    | 61       | 0.86x     | 0.77x     | 0.84x | 0.85x | 0.71x | 0.74x | 0.61x |
+| 2    | 3    | 105      | 0.88x     | 0.87x     | 0.94x | 0.93x | 0.82x | 0.98x | 0.87x |
+| 3    | 1    | 22       | 0.94x     | 0.85x     | 0.79x | 0.81x | 0.57x | 0.57x | 0.44x |
+| 3    | 2    | 32       | 0.92x     | 0.89x     | 0.84x | 0.83x | 0.73x | 0.62x | 0.53x |
+| 3    | 3    | 48       | 0.78x     | 0.79x     | 0.78x | 0.80x | 0.74x | 0.61x | 0.62x |
+| 4    | 1    | 14       | 0.71x     | 0.68x     | 0.70x | 0.71x | 0.54x | 0.47x | 0.35x |
+| 4    | 2    | 23       | 0.77x     | 0.79x     | 0.85x | 0.86x | 0.67x | 0.68x | 0.50x |
+| 4    | 3    | 36       | 0.69x     | 0.77x     | 0.84x | 0.81x | 0.73x | 0.65x | 0.58x |
+| 6    | 1    | 10       | 0.65x     | 0.59x     | 0.72x | 0.68x | 0.59x | 0.58x | 0.36x |
+| 6    | 2    | 15       | 0.64x     | 0.72x     | 0.75x | 0.73x | 0.68x | 0.63x | 0.43x |
+| 6    | 3    | 27       | 0.61x     | 0.80x     | 0.89x | 0.90x | 0.82x | 0.83x | 0.61x |
+| 8    | 1    | 10       | 0.69x     | 0.70x     | 0.67x | 0.73x | 0.62x | 0.23x | 0.33x |
+| 8    | 2    | 18       | 0.70x     | 0.90x     | 0.87x | 0.89x | 0.83x | 0.62x | 0.43x |
+| 8    | 3    | 33       | 0.60x     | 0.70x     | 0.99x | 0.95x | 0.91x | 0.44x | 0.61x |
+
 
 > At n=18, GPU overhead dominates. No optimization makes GPU consistently faster.
 
 ### n=20 (1M coefficients)
 
-| fold | rate | CPU (ms) | Opt 1 | Opt 2 | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
-|------|------|----------|-------|-------|-------|-------|-------|-------|-------|
-| 1 | 1 | 278 | 0.86x | 0.80x | 0.91x | 0.88x | 0.82x | 0.80x | 0.92x |
-| 1 | 2 | 481 | 0.87x | 0.87x | 0.99x | 0.99x | 0.96x | **1.05x** | **1.15x** |
-| 1 | 3 | 920 | 0.88x | 0.91x | **1.19x** | **1.23x** | **1.23x** | **1.27x** | **1.28x** |
-| 2 | 1 | 123 | 0.87x | 0.82x | 0.91x | 0.92x | 0.84x | 0.94x | 0.85x |
-| 2 | 2 | 210 | 0.84x | 0.84x | 0.94x | 0.92x | 0.90x | **1.16x** | **1.08x** |
-| 2 | 3 | 391 | 0.82x | 0.87x | **1.14x** | **1.17x** | **1.15x** | **1.29x** | **1.25x** |
-| 3 | 1 | 63 | 0.82x | 0.88x | 0.86x | 0.80x | 0.81x | 0.80x | 0.67x |
-| 3 | 2 | 99 | 0.79x | 0.81x | 0.91x | 0.90x | 0.83x | 0.97x | 0.85x |
-| 3 | 3 | 190 | 0.78x | 0.85x | 1.05x | **1.06x** | 1.01x | **1.23x** | **1.13x** |
-| 4 | 1 | 44 | 0.71x | 0.78x | 0.83x | 0.75x | 0.74x | 0.73x | 0.55x |
-| 4 | 2 | 80 | 0.69x | 0.81x | 0.91x | 0.90x | 0.85x | 1.02x | 0.81x |
-| 4 | 3 | 205 | 0.94x | 1.01x | **1.15x** | **1.18x** | **1.26x** | **1.40x** | **1.49x** |
-| 6 | 1 | 37 | 0.53x | 0.62x | 0.77x | 0.85x | 0.73x | 0.76x | 0.55x |
-| 6 | 2 | 114 | 0.97x | 0.96x | **1.08x** | 0.88x | **1.15x** | **1.07x** | - |
-| 6 | 3 | 422 | 0.66x | 0.63x | 0.79x | 0.93x | 0.57x | 0.81x | **1.10x** |
-| 8 | 1 | 25 | 0.45x | 0.59x | 0.78x | 0.79x | 0.76x | 0.78x | 0.50x |
-| 8 | 2 | 47 | 0.51x | 0.69x | 0.97x | 0.90x | 0.93x | 1.04x | 0.78x |
-| 8 | 3 | 114 | 0.59x | 0.84x | **1.14x** | **1.25x** | **1.24x** | **1.35x** | **1.21x** |
+
+| fold | rate | CPU (ms) | Opt 1 | Opt 2 | Opt 3     | Opt 4     | Opt 5     | Opt 6     | Opt 7     |
+| ---- | ---- | -------- | ----- | ----- | --------- | --------- | --------- | --------- | --------- |
+| 1    | 1    | 278      | 0.86x | 0.80x | 0.91x     | 0.88x     | 0.82x     | 0.80x     | 0.92x     |
+| 1    | 2    | 481      | 0.87x | 0.87x | 0.99x     | 0.99x     | 0.96x     | **1.05x** | **1.15x** |
+| 1    | 3    | 920      | 0.88x | 0.91x | **1.19x** | **1.23x** | **1.23x** | **1.27x** | **1.28x** |
+| 2    | 1    | 123      | 0.87x | 0.82x | 0.91x     | 0.92x     | 0.84x     | 0.94x     | 0.85x     |
+| 2    | 2    | 210      | 0.84x | 0.84x | 0.94x     | 0.92x     | 0.90x     | **1.16x** | **1.08x** |
+| 2    | 3    | 391      | 0.82x | 0.87x | **1.14x** | **1.17x** | **1.15x** | **1.29x** | **1.25x** |
+| 3    | 1    | 63       | 0.82x | 0.88x | 0.86x     | 0.80x     | 0.81x     | 0.80x     | 0.67x     |
+| 3    | 2    | 99       | 0.79x | 0.81x | 0.91x     | 0.90x     | 0.83x     | 0.97x     | 0.85x     |
+| 3    | 3    | 190      | 0.78x | 0.85x | 1.05x     | **1.06x** | 1.01x     | **1.23x** | **1.13x** |
+| 4    | 1    | 44       | 0.71x | 0.78x | 0.83x     | 0.75x     | 0.74x     | 0.73x     | 0.55x     |
+| 4    | 2    | 80       | 0.69x | 0.81x | 0.91x     | 0.90x     | 0.85x     | 1.02x     | 0.81x     |
+| 4    | 3    | 205      | 0.94x | 1.01x | **1.15x** | **1.18x** | **1.26x** | **1.40x** | **1.49x** |
+| 6    | 1    | 37       | 0.53x | 0.62x | 0.77x     | 0.85x     | 0.73x     | 0.76x     | 0.55x     |
+| 6    | 2    | 114      | 0.97x | 0.96x | **1.08x** | 0.88x     | **1.15x** | **1.07x** | -         |
+| 6    | 3    | 422      | 0.66x | 0.63x | 0.79x     | 0.93x     | 0.57x     | 0.81x     | **1.10x** |
+| 8    | 1    | 25       | 0.45x | 0.59x | 0.78x     | 0.79x     | 0.76x     | 0.78x     | 0.50x     |
+| 8    | 2    | 47       | 0.51x | 0.69x | 0.97x     | 0.90x     | 0.93x     | 1.04x     | 0.78x     |
+| 8    | 3    | 114      | 0.59x | 0.84x | **1.14x** | **1.25x** | **1.24x** | **1.35x** | **1.21x** |
+
 
 > GPU crossover at rate=3. Opt 3 (GPU Merkle) was the turning point. Opt 7 (Grind) wins at fold=4-6.
 
 ### n=22 (4M coefficients)
 
-| fold | rate | CPU (ms) | Opt 1 | Opt 2 | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
-|------|------|----------|-------|-------|-------|-------|-------|-------|-------|
-| 1 | 1 | 1051 | 0.87x | 0.89x | **1.15x** | **1.15x** | **1.18x** | **1.24x** | **1.21x** |
-| 1 | 2 | 1895 | 0.85x | 0.89x | **1.20x** | - | **1.29x** | **1.34x** | **1.30x** |
-| 1 | 3 | 3717 | 0.83x | 0.90x | **1.29x** | **1.34x** | **1.43x** | **1.44x** | **1.42x** |
-| 2 | 1 | 464 | 0.85x | 0.90x | **1.14x** | **1.17x** | **1.10x** | **1.24x** | **1.15x** |
-| 2 | 2 | 841 | 0.79x | 0.87x | **1.24x** | **1.26x** | **1.30x** | **1.39x** | **1.35x** |
-| 2 | 3 | 1720 | 0.86x | 0.94x | **1.35x** | **1.46x** | **1.47x** | **1.56x** | **1.54x** |
-| 3 | 1 | 223 | 0.80x | 0.88x | 1.04x | 0.94x | 1.01x | **1.12x** | **1.07x** |
-| 3 | 2 | 410 | 0.81x | 0.73x | **1.09x** | **1.19x** | **1.11x** | **1.29x** | **1.25x** |
-| 3 | 3 | 864 | 0.76x | 0.91x | **1.11x** | **1.27x** | **1.05x** | **1.24x** | **1.39x** |
-| 4 | 1 | 175 | 0.79x | 0.90x | **1.10x** | **1.10x** | **1.08x** | **1.29x** | **1.17x** |
-| 4 | 2 | 328 | 0.75x | 0.93x | **1.17x** | **1.28x** | **1.29x** | **1.42x** | **1.51x** |
-| 4 | 3 | 887 | 0.92x | 0.98x | **1.38x** | **1.57x** | **1.57x** | **1.71x** | **1.88x** |
-| 6 | 1 | 150 | 0.69x | 0.93x | 1.02x | **1.09x** | 1.01x | **1.27x** | **1.32x** |
-| 6 | 2 | 504 | 0.97x | 0.98x | 0.77x | **1.16x** | **1.40x** | **1.18x** | **1.94x** |
-| 6 | 3 | 2533 | **1.09x** | **1.36x** | **1.66x** | **1.30x** | **1.49x** | **1.30x** | **2.24x** |
-| 8 | 1 | 174 | 0.98x | **1.46x** | **2.04x** | **2.18x** | **2.10x** | **2.33x** | **1.86x** |
-| 8 | 2 | 214 | 0.58x | 0.99x | **1.39x** | **1.52x** | **1.53x** | **1.62x** | **1.43x** |
-| 8 | 3 | 449 | 0.58x | 1.01x | **1.37x** | **1.28x** | **1.38x** | **1.59x** | **1.54x** |
+
+| fold | rate | CPU (ms) | Opt 1     | Opt 2     | Opt 3     | Opt 4     | Opt 5     | Opt 6     | Opt 7     |
+| ---- | ---- | -------- | --------- | --------- | --------- | --------- | --------- | --------- | --------- |
+| 1    | 1    | 1051     | 0.87x     | 0.89x     | **1.15x** | **1.15x** | **1.18x** | **1.24x** | **1.21x** |
+| 1    | 2    | 1895     | 0.85x     | 0.89x     | **1.20x** | -         | **1.29x** | **1.34x** | **1.30x** |
+| 1    | 3    | 3717     | 0.83x     | 0.90x     | **1.29x** | **1.34x** | **1.43x** | **1.44x** | **1.42x** |
+| 2    | 1    | 464      | 0.85x     | 0.90x     | **1.14x** | **1.17x** | **1.10x** | **1.24x** | **1.15x** |
+| 2    | 2    | 841      | 0.79x     | 0.87x     | **1.24x** | **1.26x** | **1.30x** | **1.39x** | **1.35x** |
+| 2    | 3    | 1720     | 0.86x     | 0.94x     | **1.35x** | **1.46x** | **1.47x** | **1.56x** | **1.54x** |
+| 3    | 1    | 223      | 0.80x     | 0.88x     | 1.04x     | 0.94x     | 1.01x     | **1.12x** | **1.07x** |
+| 3    | 2    | 410      | 0.81x     | 0.73x     | **1.09x** | **1.19x** | **1.11x** | **1.29x** | **1.25x** |
+| 3    | 3    | 864      | 0.76x     | 0.91x     | **1.11x** | **1.27x** | **1.05x** | **1.24x** | **1.39x** |
+| 4    | 1    | 175      | 0.79x     | 0.90x     | **1.10x** | **1.10x** | **1.08x** | **1.29x** | **1.17x** |
+| 4    | 2    | 328      | 0.75x     | 0.93x     | **1.17x** | **1.28x** | **1.29x** | **1.42x** | **1.51x** |
+| 4    | 3    | 887      | 0.92x     | 0.98x     | **1.38x** | **1.57x** | **1.57x** | **1.71x** | **1.88x** |
+| 6    | 1    | 150      | 0.69x     | 0.93x     | 1.02x     | **1.09x** | 1.01x     | **1.27x** | **1.32x** |
+| 6    | 2    | 504      | 0.97x     | 0.98x     | 0.77x     | **1.16x** | **1.40x** | **1.18x** | **1.94x** |
+| 6    | 3    | 2533     | **1.09x** | **1.36x** | **1.66x** | **1.30x** | **1.49x** | **1.30x** | **2.24x** |
+| 8    | 1    | 174      | 0.98x     | **1.46x** | **2.04x** | **2.18x** | **2.10x** | **2.33x** | **1.86x** |
+| 8    | 2    | 214      | 0.58x     | 0.99x     | **1.39x** | **1.52x** | **1.53x** | **1.62x** | **1.43x** |
+| 8    | 3    | 449      | 0.58x     | 1.01x     | **1.37x** | **1.28x** | **1.38x** | **1.59x** | **1.54x** |
+
 
 > GPU wins everywhere at n=22. Best per-opt: Opt 3 introduced 2.04x, Opt 6 reached 2.33x, Opt 7 reached 2.24x.
 > Opt 7 (Grind) dominates at high rate: fold=6 rate=3 goes from 1.30x (Opt 6) to 2.24x.
 
 ### n=24 (16M coefficients)
 
-| fold | rate | CPU (ms) | Opt 1 | Opt 2 | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
-|------|------|----------|-------|-------|-------|-------|-------|-------|-------|
-| 1 | 1 | 6578 | **1.24x** | **1.37x** | **1.91x** | **1.94x** | **2.04x** | **2.08x** | **2.04x** |
-| 2 | 1 | 1880 | 0.81x | 0.90x | **1.27x** | **1.36x** | **1.33x** | **1.39x** | **1.38x** |
-| 3 | 1 | 918 | 0.72x | 0.88x | **1.17x** | **1.25x** | **1.25x** | **1.37x** | **1.30x** |
-| 4 | 1 | 903 | 0.72x | 0.88x | **1.11x** | **1.12x** | **1.29x** | **1.18x** | **1.41x** |
-| 6 | 1 | 554 | 0.59x | 0.85x | - | **1.11x** | - | **1.30x** | **1.52x** |
-| 8 | 1 | 27576 | 0.99x | 0.84x | - | 0.71x | 0.91x | 0.83x | **2.58x** |
+
+| fold | rate | CPU (ms) | Opt 1     | Opt 2     | Opt 3     | Opt 4     | Opt 5     | Opt 6     | Opt 7     |
+| ---- | ---- | -------- | --------- | --------- | --------- | --------- | --------- | --------- | --------- |
+| 1    | 1    | 6578     | **1.24x** | **1.37x** | **1.91x** | **1.94x** | **2.04x** | **2.08x** | **2.04x** |
+| 2    | 1    | 1880     | 0.81x     | 0.90x     | **1.27x** | **1.36x** | **1.33x** | **1.39x** | **1.38x** |
+| 3    | 1    | 918      | 0.72x     | 0.88x     | **1.17x** | **1.25x** | **1.25x** | **1.37x** | **1.30x** |
+| 4    | 1    | 903      | 0.72x     | 0.88x     | **1.11x** | **1.12x** | **1.29x** | **1.18x** | **1.41x** |
+| 6    | 1    | 554      | 0.59x     | 0.85x     | -         | **1.11x** | -         | **1.30x** | **1.52x** |
+| 8    | 1    | 27576    | 0.99x     | 0.84x     | -         | 0.71x     | 0.91x     | 0.83x     | **2.58x** |
+
 
 > Only rate=1 testable on GPU (rate=2+ exceeds domain limit 2^25).
 > fold=8 rate=1 has extreme PoW grinding: only Opt 7 (GPU Grind) unlocks 2.58x.
@@ -427,12 +444,14 @@ All measurements on Apple M-series silicon. Median of 3 runs.
 
 ### Best speedup per optimization (any fold/rate)
 
-| n | Opt 1 | Opt 2 | Opt 3 | Opt 4 | Opt 5 | Opt 6 | Opt 7 |
-|---|-------|-------|-------|-------|-------|-------|-------|
-| 18 | 1.08x | 1.08x | 0.99x | 0.95x | 0.91x | 0.98x | 0.99x |
-| 20 | 0.97x | 1.01x | **1.19x** | **1.25x** | **1.26x** | **1.40x** | **1.49x** |
-| 22 | 1.09x | **1.46x** | **2.04x** | **2.18x** | **2.10x** | **2.33x** | **2.24x** |
-| 24 | **1.24x** | **1.37x** | **1.91x** | **1.94x** | **2.04x** | **2.08x** | **2.58x** |
+
+| n   | Opt 1     | Opt 2     | Opt 3     | Opt 4     | Opt 5     | Opt 6     | Opt 7     |
+| --- | --------- | --------- | --------- | --------- | --------- | --------- | --------- |
+| 18  | 1.08x     | 1.08x     | 0.99x     | 0.95x     | 0.91x     | 0.98x     | 0.99x     |
+| 20  | 0.97x     | 1.01x     | **1.19x** | **1.25x** | **1.26x** | **1.40x** | **1.49x** |
+| 22  | 1.09x     | **1.46x** | **2.04x** | **2.18x** | **2.10x** | **2.33x** | **2.24x** |
+| 24  | **1.24x** | **1.37x** | **1.91x** | **1.94x** | **2.04x** | **2.08x** | **2.58x** |
+
 
 > **Key takeaway**: The biggest single jump was Opt 3 (GPU Merkle), which moved n=22
 > from ~1x to 2x. Opt 7 (GPU Grind) unlocked the PoW-dominated configs that no prior
@@ -440,12 +459,116 @@ All measurements on Apple M-series silicon. Median of 3 runs.
 
 ---
 
-## Comprehensive Benchmark Results (Final State)
+## Current GPU/CPU Speedup
+
+Best GPU speedup over CPU for every parameter combination (final state with
+all optimizations applied). Values > 1.0 mean GPU is faster than CPU.
+
+### n=18 (256K coefficients)
+
+
+| fold | rate | CPU (ms) | GPU (ms) | Speedup   |
+| ---- | ---- | -------- | -------- | --------- |
+| 1    | 1    | 108      | 108      | 1.00x     |
+| 1    | 2    | 134      | 134      | 1.00x     |
+| 1    | 3    | 243      | 230      | **1.06x** |
+| 2    | 1    | 42       | 42       | 1.00x     |
+| 2    | 2    | 61       | 61       | 1.00x     |
+| 2    | 3    | 105      | 105      | 1.00x     |
+| 3    | 1    | 22       | 22       | 1.00x     |
+| 3    | 2    | 32       | 32       | 1.00x     |
+| 3    | 3    | 48       | 48       | 1.00x     |
+| 4    | 1    | 14       | 14       | 1.00x     |
+| 4    | 2    | 23       | 23       | 1.00x     |
+| 4    | 3    | 36       | 36       | 1.00x     |
+| 6    | 1    | 10       | 10       | 1.00x     |
+| 6    | 2    | 15       | 15       | 1.00x     |
+| 6    | 3    | 27       | 27       | 1.00x     |
+| 8    | 1    | 10       | 10       | 1.00x     |
+| 8    | 2    | 18       | 18       | 1.00x     |
+| 8    | 3    | 33       | 33       | 1.00x     |
+
+
+> GPU overhead > benefit at this size. CPU is used (GPU is not activated).
+
+### n=20 (1M coefficients)
+
+
+| fold | rate | CPU (ms) | GPU (ms) | Speedup   |
+| ---- | ---- | -------- | -------- | --------- |
+| 1    | 1    | 278      | 265      | **1.05x** |
+| 1    | 2    | 481      | 415      | **1.16x** |
+| 1    | 3    | 920      | 689      | **1.33x** |
+| 2    | 1    | 123      | 122      | 1.01x     |
+| 2    | 2    | 210      | 182      | **1.16x** |
+| 2    | 3    | 391      | 297      | **1.32x** |
+| 3    | 1    | 63       | 63       | 1.00x     |
+| 3    | 2    | 99       | 99       | 1.00x     |
+| 3    | 3    | 190      | 156      | **1.22x** |
+| 4    | 1    | 45       | 45       | 1.00x     |
+| 4    | 2    | 80       | 79       | 1.01x     |
+| 4    | 3    | 205      | 138      | **1.49x** |
+| 6    | 1    | 37       | 37       | 1.00x     |
+| 6    | 2    | 114      | 114      | 1.00x     |
+| 6    | 3    | 422      | 382      | **1.10x** |
+| 8    | 1    | 25       | 25       | 1.00x     |
+| 8    | 2    | 47       | 44       | **1.07x** |
+| 8    | 3    | 114      | 87       | **1.30x** |
+
+
+> GPU crossover at rate=2-3. Best: **1.49x** at fold=4, rate=3.
+
+### n=22 (4M coefficients)
+
+
+| fold  | rate  | CPU (ms) | GPU (ms) | Speedup   |
+| ----- | ----- | -------- | -------- | --------- |
+| 1     | 1     | 1051     | 863      | **1.22x** |
+| 1     | 2     | 1895     | 1421     | **1.33x** |
+| 1     | 3     | 3717     | 2603     | **1.43x** |
+| 2     | 1     | 464      | 385      | **1.20x** |
+| 2     | 2     | 841      | 607      | **1.39x** |
+| 2     | 3     | 1720     | 1092     | **1.57x** |
+| 3     | 1     | 223      | 187      | **1.19x** |
+| 3     | 2     | 410      | 329      | **1.25x** |
+| 3     | 3     | 864      | 622      | **1.39x** |
+| 4     | 1     | 175      | 133      | **1.32x** |
+| 4     | 2     | 328      | 212      | **1.55x** |
+| **4** | **3** | **887**  | **471**  | **1.88x** |
+| 6     | 1     | 150      | 113      | **1.32x** |
+| **6** | **2** | **504**  | **260**  | **1.94x** |
+| **6** | **3** | **2533** | **1129** | **2.24x** |
+| 8     | 1     | 174      | 81       | **2.15x** |
+| 8     | 2     | 214      | 142      | **1.51x** |
+| 8     | 3     | 449      | 292      | **1.54x** |
+
+
+> GPU wins across all configs. Best: **2.24x** at fold=6, rate=3.
+
+### n=24 (16M coefficients)
+
+
+| fold  | rate  | CPU (ms)  | GPU (ms)  | Speedup   |
+| ----- | ----- | --------- | --------- | --------- |
+| 1     | 1     | 6578      | 3229      | **2.04x** |
+| 2     | 1     | 1880      | 1355      | **1.39x** |
+| 3     | 1     | 918       | 692       | **1.33x** |
+| 4     | 1     | 903       | 642       | **1.41x** |
+| 6     | 1     | 554       | 365       | **1.52x** |
+| **8** | **1** | **27576** | **10676** | **2.58x** |
+
+
+> Only rate=1 fits GPU domain limit (2^25). Best: **2.58x** at fold=8, rate=1.
+
+---
+
+## Detailed Benchmark Results (All GPU Modes)
 
 All times in milliseconds. Median of 3 runs.
 `rs_domain_initial_reduction_factor = min(fold, 3)` to allow fold < 3.
 
 **Columns:**
+
 - **CPU** — pure CPU prover (baseline)
 - **GPU** — GPU NTT + Merkle, commit-only fusion, CPU PoW grinding
 - **Fused** — GPU NTT + Merkle, full pipeline fusion, CPU PoW grinding
@@ -453,89 +576,97 @@ All times in milliseconds. Median of 3 runs.
 
 ### n=18 (256K coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
-|------|------|----------|----------|------------|------------|--------------|
-| 1 | 1 | 108 | 121 | 142 | 158 | 0.89x GPU |
-| 1 | 2 | 134 | 172 | 182 | 201 | 0.78x GPU |
-| 1 | 3 | 243 | 230 | 230 | 247 | **1.06x** GPU |
-| 2 | 1 | 42 | 60 | 62 | 80 | 0.70x GPU |
-| 2 | 2 | 61 | 75 | 83 | 99 | 0.80x GPU |
-| 2 | 3 | 105 | 107 | 107 | 122 | 0.99x GPU |
-| 3 | 1 | 22 | 26 | 34 | 49 | 0.83x GPU |
-| 3 | 2 | 32 | 40 | 44 | 59 | 0.79x GPU |
-| 3 | 3 | 48 | 60 | 63 | 76 | 0.79x GPU |
-| 4 | 1 | 14 | 22 | 26 | 39 | 0.62x GPU |
-| 4 | 2 | 24 | 30 | 34 | 53 | 0.80x GPU |
-| 4 | 3 | 37 | 41 | 44 | 59 | 0.90x GPU |
-| 6 | 1 | 11 | 18 | 20 | 37 | 0.62x GPU |
-| 6 | 2 | 18 | 24 | 26 | 43 | 0.76x GPU |
-| 6 | 3 | 29 | 32 | 35 | 52 | 0.91x GPU |
-| 8 | 1 | 10 | 16 | 18 | 33 | 0.64x GPU |
-| 8 | 2 | 18 | 21 | 24 | 42 | 0.87x GPU |
-| 8 | 3 | 33 | 35 | 36 | 54 | 0.93x GPU |
+
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup  |
+| ---- | ---- | -------- | -------- | ---------- | ---------- | ------------- |
+| 1    | 1    | 108      | 121      | 142        | 158        | 0.89x GPU     |
+| 1    | 2    | 134      | 172      | 182        | 201        | 0.78x GPU     |
+| 1    | 3    | 243      | 230      | 230        | 247        | **1.06x** GPU |
+| 2    | 1    | 42       | 60       | 62         | 80         | 0.70x GPU     |
+| 2    | 2    | 61       | 75       | 83         | 99         | 0.80x GPU     |
+| 2    | 3    | 105      | 107      | 107        | 122        | 0.99x GPU     |
+| 3    | 1    | 22       | 26       | 34         | 49         | 0.83x GPU     |
+| 3    | 2    | 32       | 40       | 44         | 59         | 0.79x GPU     |
+| 3    | 3    | 48       | 60       | 63         | 76         | 0.79x GPU     |
+| 4    | 1    | 14       | 22       | 26         | 39         | 0.62x GPU     |
+| 4    | 2    | 24       | 30       | 34         | 53         | 0.80x GPU     |
+| 4    | 3    | 37       | 41       | 44         | 59         | 0.90x GPU     |
+| 6    | 1    | 11       | 18       | 20         | 37         | 0.62x GPU     |
+| 6    | 2    | 18       | 24       | 26         | 43         | 0.76x GPU     |
+| 6    | 3    | 29       | 32       | 35         | 52         | 0.91x GPU     |
+| 8    | 1    | 10       | 16       | 18         | 33         | 0.64x GPU     |
+| 8    | 2    | 18       | 21       | 24         | 42         | 0.87x GPU     |
+| 8    | 3    | 33       | 35       | 36         | 54         | 0.93x GPU     |
+
 
 > GPU overhead dominates at this size. All configs slower than or matching CPU.
 
 ### n=20 (1M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
-|------|------|----------|----------|------------|------------|--------------|
-| 1 | 1 | 278 | 265 | 279 | 301 | 1.05x GPU |
-| 1 | 2 | 481 | 415 | 424 | 417 | **1.16x** GPU |
-| 1 | 3 | 920 | 744 | 689 | 718 | **1.33x** Fused |
-| 2 | 1 | 123 | 122 | 129 | 145 | 1.01x GPU |
-| 2 | 2 | 210 | 183 | 182 | 195 | **1.16x** Fused |
-| 2 | 3 | 391 | 313 | 297 | 313 | **1.32x** Fused |
-| 3 | 1 | 63 | 68 | 77 | 93 | 0.92x GPU |
-| 3 | 2 | 99 | 100 | 104 | 117 | 0.99x GPU |
-| 3 | 3 | 190 | 164 | 156 | 169 | **1.22x** Fused |
-| 4 | 1 | 45 | 57 | 60 | 81 | 0.79x GPU |
-| 4 | 2 | 80 | 82 | 79 | 98 | 1.01x Fused |
-| 4 | 3 | 205 | 238 | 152 | 138 | **1.49x** Grind |
-| 6 | 1 | 37 | 50 | 50 | 68 | 0.75x GPU |
-| 6 | 2 | 114 | 120 | 119 | fail | 0.95x GPU |
-| 6 | 3 | 422 | 567 | 751 | 382 | **1.10x** Grind |
-| 8 | 1 | 25 | 32 | 34 | 50 | 0.78x GPU |
-| 8 | 2 | 47 | 44 | 48 | 60 | **1.07x** GPU |
-| 8 | 3 | 114 | 87 | 93 | 94 | **1.30x** GPU |
+
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup    |
+| ---- | ---- | -------- | -------- | ---------- | ---------- | --------------- |
+| 1    | 1    | 278      | 265      | 279        | 301        | 1.05x GPU       |
+| 1    | 2    | 481      | 415      | 424        | 417        | **1.16x** GPU   |
+| 1    | 3    | 920      | 744      | 689        | 718        | **1.33x** Fused |
+| 2    | 1    | 123      | 122      | 129        | 145        | 1.01x GPU       |
+| 2    | 2    | 210      | 183      | 182        | 195        | **1.16x** Fused |
+| 2    | 3    | 391      | 313      | 297        | 313        | **1.32x** Fused |
+| 3    | 1    | 63       | 68       | 77         | 93         | 0.92x GPU       |
+| 3    | 2    | 99       | 100      | 104        | 117        | 0.99x GPU       |
+| 3    | 3    | 190      | 164      | 156        | 169        | **1.22x** Fused |
+| 4    | 1    | 45       | 57       | 60         | 81         | 0.79x GPU       |
+| 4    | 2    | 80       | 82       | 79         | 98         | 1.01x Fused     |
+| 4    | 3    | 205      | 238      | 152        | 138        | **1.49x** Grind |
+| 6    | 1    | 37       | 50       | 50         | 68         | 0.75x GPU       |
+| 6    | 2    | 114      | 120      | 119        | fail       | 0.95x GPU       |
+| 6    | 3    | 422      | 567      | 751        | 382        | **1.10x** Grind |
+| 8    | 1    | 25       | 32       | 34         | 50         | 0.78x GPU       |
+| 8    | 2    | 47       | 44       | 48         | 60         | **1.07x** GPU   |
+| 8    | 3    | 114      | 87       | 93         | 94         | **1.30x** GPU   |
+
 
 > GPU starts winning at rate=2-3. Grind shines at fold=4-6, rate=3.
 
 ### n=22 (4M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
-|------|------|----------|----------|------------|------------|--------------|
-| 1 | 1 | 1051 | 893 | 863 | 868 | **1.22x** Fused |
-| 1 | 2 | 1895 | 1528 | 1421 | 1462 | **1.33x** Fused |
-| 1 | 3 | 3717 | 2845 | 2603 | 2609 | **1.43x** Fused |
-| 2 | 1 | 464 | 394 | 385 | 403 | **1.20x** Fused |
-| 2 | 2 | 841 | 648 | 607 | 621 | **1.39x** Fused |
-| 2 | 3 | 1720 | 1198 | 1092 | 1120 | **1.57x** Fused |
-| 3 | 1 | 223 | 199 | 187 | 208 | **1.19x** Fused |
-| 3 | 2 | 410 | 343 | 329 | 329 | **1.25x** Grind |
-| 3 | 3 | 864 | 750 | 639 | 622 | **1.39x** Grind |
-| 4 | 1 | 175 | 143 | 133 | 150 | **1.32x** Fused |
-| 4 | 2 | 328 | 236 | 212 | 217 | **1.55x** Fused |
-| **4** | **3** | **887** | **626** | **570** | **471** | **1.88x Grind** |
-| 6 | 1 | 150 | 128 | 119 | 113 | **1.32x** Grind |
-| **6** | **2** | **504** | **363** | **279** | **260** | **1.94x Grind** |
-| **6** | **3** | **2533** | **fail** | **1778** | **1129** | **2.24x Grind** |
-| 8 | 1 | 174 | 83 | 81 | 93 | **2.15x** Fused |
-| 8 | 2 | 214 | 148 | 142 | 149 | **1.51x** Fused |
-| 8 | 3 | 449 | 349 | 299 | 292 | **1.54x** Grind |
+
+| fold  | rate  | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup    |
+| ----- | ----- | -------- | -------- | ---------- | ---------- | --------------- |
+| 1     | 1     | 1051     | 893      | 863        | 868        | **1.22x** Fused |
+| 1     | 2     | 1895     | 1528     | 1421       | 1462       | **1.33x** Fused |
+| 1     | 3     | 3717     | 2845     | 2603       | 2609       | **1.43x** Fused |
+| 2     | 1     | 464      | 394      | 385        | 403        | **1.20x** Fused |
+| 2     | 2     | 841      | 648      | 607        | 621        | **1.39x** Fused |
+| 2     | 3     | 1720     | 1198     | 1092       | 1120       | **1.57x** Fused |
+| 3     | 1     | 223      | 199      | 187        | 208        | **1.19x** Fused |
+| 3     | 2     | 410      | 343      | 329        | 329        | **1.25x** Grind |
+| 3     | 3     | 864      | 750      | 639        | 622        | **1.39x** Grind |
+| 4     | 1     | 175      | 143      | 133        | 150        | **1.32x** Fused |
+| 4     | 2     | 328      | 236      | 212        | 217        | **1.55x** Fused |
+| **4** | **3** | **887**  | **626**  | **570**    | **471**    | **1.88x Grind** |
+| 6     | 1     | 150      | 128      | 119        | 113        | **1.32x** Grind |
+| **6** | **2** | **504**  | **363**  | **279**    | **260**    | **1.94x Grind** |
+| **6** | **3** | **2533** | **fail** | **1778**   | **1129**   | **2.24x Grind** |
+| 8     | 1     | 174      | 83       | 81         | 93         | **2.15x** Fused |
+| 8     | 2     | 214      | 148      | 142        | 149        | **1.51x** Fused |
+| 8     | 3     | 449      | 349      | 299        | 292        | **1.54x** Grind |
+
 
 > Best result: **2.24x** Grind at fold=6, rate=3. Fused wins at fold=1-2 (many tiny rounds).
 
 ### n=24 (16M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
-|------|------|----------|----------|------------|------------|--------------|
-| 1 | 1 | 6578 | 4530 | 3304 | 3229 | **2.04x** Grind |
-| 2 | 1 | 1880 | 1434 | 1355 | 1360 | **1.39x** Fused |
-| 3 | 1 | 918 | 728 | 692 | 704 | **1.33x** Fused |
-| 4 | 1 | 903 | 734 | 803 | 642 | **1.41x** Grind |
-| 6 | 1 | 554 | 409 | 522 | 365 | **1.52x** Grind |
-| **8** | **1** | **27576** | **38115** | **38836** | **10676** | **2.58x Grind** |
+
+| fold  | rate  | CPU (ms)  | GPU (ms)  | Fused (ms) | Grind (ms) | Best speedup    |
+| ----- | ----- | --------- | --------- | ---------- | ---------- | --------------- |
+| 1     | 1     | 6578      | 4530      | 3304       | 3229       | **2.04x** Grind |
+| 2     | 1     | 1880      | 1434      | 1355       | 1360       | **1.39x** Fused |
+| 3     | 1     | 918       | 728       | 692        | 704        | **1.33x** Fused |
+| 4     | 1     | 903       | 734       | 803        | 642        | **1.41x** Grind |
+| 6     | 1     | 554       | 409       | 522        | 365        | **1.52x** Grind |
+| **8** | **1** | **27576** | **38115** | **38836**  | **10676**  | **2.58x Grind** |
+
 
 > Only rate=1 testable on GPU (rate=2+ exceeds domain limit 2^25).
 > fold=8 at n=24 has extreme PoW grinding → **2.58x** Grind, the biggest speedup overall.
@@ -592,12 +723,15 @@ to use; the overhead for the GPU PoW path is small even when grinding is fast.
 
 ### Optimization progression
 
-| # | Optimization | Key improvement |
-|---|-------------|-----------------|
-| 1 | GPU NTT (Metal) | Established GPU pipeline |
-| 2 | Radix-16 DIF + zero-copy | 4x fewer dispatches, no memcpy |
-| 3 | GPU Poseidon2 Merkle | ~10% whir_prove speedup |
-| 4 | Fused DFT→Merkle | ~15-18% additional speedup |
-| 5 | Fused prover rounds | Up to 1.63x total |
-| 6 | Lower threshold + zero-copy bitrev | Up to 1.88x total |
-| 7 | GPU PoW Grinding + buffer caching | **Up to 2.58x total** |
+
+| #   | Optimization                       | Key improvement                |
+| --- | ---------------------------------- | ------------------------------ |
+| 1   | GPU NTT (Metal)                    | Established GPU pipeline       |
+| 2   | Radix-16 DIF + zero-copy           | 4x fewer dispatches, no memcpy |
+| 3   | GPU Poseidon2 Merkle               | ~10% whir_prove speedup        |
+| 4   | Fused DFT→Merkle                   | ~15-18% additional speedup     |
+| 5   | Fused prover rounds                | Up to 1.63x total              |
+| 6   | Lower threshold + zero-copy bitrev | Up to 1.88x total              |
+| 7   | GPU PoW Grinding + buffer caching  | **Up to 2.58x total**          |
+
+
