@@ -295,8 +295,8 @@ fn main() {
         }
     }
 
-    let max_log_domain_gpu: usize = 25;
-    let max_cpu_secs = 30.0;
+    let max_log_domain_gpu: usize = 27;
+    let max_cpu_secs = 120.0;
 
     let header = format!(
         "{:<6} {:<6} {:<6} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>8}",

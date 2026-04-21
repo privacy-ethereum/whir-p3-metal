@@ -59,6 +59,36 @@ pub trait DftCommitFusion<F: Field>: Mmcs<F> {
     {
         Err(mat)
     }
+
+    /// Fused transpose + pad + DFT + commit for base field.
+    /// Input is a flat slice representing an [in_rows × in_cols] matrix.
+    /// Returns `None` if the implementation doesn't support this operation.
+    fn transpose_pad_dft_and_commit(
+        &self,
+        _data: &[F],
+        _in_rows: usize,
+        _in_cols: usize,
+        _padded_height: usize,
+    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<F>>)> {
+        None
+    }
+
+    /// Fused transpose + pad + DFT + commit for extension field.
+    fn transpose_pad_dft_algebra_and_commit<EF>(
+        &self,
+        _data: &[EF],
+        _in_rows: usize,
+        _in_cols: usize,
+        _padded_height: usize,
+    ) -> Option<(
+        Self::Commitment,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
+    )>
+    where
+        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
+    {
+        None
+    }
 }
 
 /// Build the Poseidon2 BabyBear width-16 constants buffer (143 Montgomery u32s)
@@ -252,6 +282,7 @@ pub struct MetalBabyBearDft {
     poseidon2_hash_leaves_ps: ComputePipelineState,
     poseidon2_compress_ps: ComputePipelineState,
     poseidon2_pow_grind_ps: ComputePipelineState,
+    transpose_pad_ps: ComputePipelineState,
     /// Poseidon2 round constants buffer (143 u32 values in Montgomery form).
     poseidon2_rc_buf: Buffer,
     /// Pre-allocated buffers for PoW grinding (avoids per-call allocation).
@@ -285,10 +316,16 @@ impl Default for MetalBabyBearDft {
 }
 
 impl MetalBabyBearDft {
-    /// Minimum log_n for GPU dispatch. The 64MB total-data threshold (in
+    /// Minimum log_n for GPU dispatch. The 8MB total-data threshold (in
     /// try_gpu_dft_inplace) is the primary gate; this only guards against
     /// degenerate cases with very few NTT stages but huge width.
     const DEFAULT_GPU_MIN_LOG_N: u32 = 14;
+    /// Maximum total bytes for GPU dispatch. Very large, narrow NTTs
+    /// (e.g. 2^26 × 2) become memory-bandwidth bound. We gate on both
+    /// log_n and total bytes to allow large-but-wide NTTs (2^21 × 64)
+    /// while blocking tall-and-narrow ones.
+    const GPU_MAX_LOG_N: u32 = 24;
+    const GPU_MAX_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
     /// Default Poseidon2 RNG seed (must match the seed used to construct the permutation).
     const DEFAULT_POSEIDON2_SEED: u64 = 1;
 
@@ -350,6 +387,7 @@ impl MetalBabyBearDft {
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
         let poseidon2_pow_grind_ps = make_ps("poseidon2_pow_grind");
+        let transpose_pad_ps = make_ps("bb_transpose_pad");
 
         let pow_tg_size = (poseidon2_pow_grind_ps.max_total_threads_per_threadgroup() as u64)
             .min(1024);
@@ -416,6 +454,7 @@ impl MetalBabyBearDft {
             poseidon2_hash_leaves_ps,
             poseidon2_compress_ps,
             poseidon2_pow_grind_ps,
+            transpose_pad_ps,
             poseidon2_rc_buf,
             pow_bufs: Mutex::new(pow_bufs),
         }
@@ -451,7 +490,15 @@ impl MetalBabyBearDft {
             *(bufs.found_buf.contents() as *mut u32) = 0;
         }
 
-        let batch_size: u64 = 1 << 20;
+        // Scale batch size with difficulty to amortize dispatch overhead.
+        // For high-bit PoW (25+ bits), use larger batches so we need fewer dispatches.
+        let batch_size: u64 = if pow_bits >= 24 {
+            1 << 24 // 16M nonces
+        } else if pow_bits >= 20 {
+            1 << 22 // 4M nonces
+        } else {
+            1 << 20 // 1M nonces
+        };
         let tg_size = bufs.tg_size;
 
         let mut nonce_offset: u64 = 0;
@@ -465,9 +512,9 @@ impl MetalBabyBearDft {
             enc.set_compute_pipeline_state(&self.poseidon2_pow_grind_ps);
             enc.set_buffer(0, Some(&bufs.state_buf), 0);
             enc.set_buffer(1, Some(&self.poseidon2_rc_buf), 0);
-            enc.set_buffer(2, Some(&bufs.params_buf), 0);  // witness_idx
-            enc.set_buffer(3, Some(&bufs.params_buf), 4);   // pow_bits (offset 4 bytes)
-            enc.set_buffer(4, Some(&bufs.params_buf), 8);   // r_squared (offset 8 bytes)
+            enc.set_buffer(2, Some(&bufs.params_buf), 0);
+            enc.set_buffer(3, Some(&bufs.params_buf), 4);
+            enc.set_buffer(4, Some(&bufs.params_buf), 8);
             enc.set_buffer(5, Some(&bufs.result_buf), 0);
             enc.set_buffer(6, Some(&bufs.found_buf), 0);
             enc.set_buffer(7, Some(&bufs.offset_buf), 0);
@@ -490,6 +537,67 @@ impl MetalBabyBearDft {
         }
 
         None
+    }
+
+    /// Transpose an [in_rows × in_cols] matrix of multi-word elements to
+    /// [out_height × in_rows] on GPU. Rows beyond in_cols are zero-filled.
+    /// `elem_size` is the number of BabyBear words per logical element
+    /// (1 for base field, 4 for quartic extension).
+    pub fn gpu_transpose_pad(
+        &self,
+        data: &[BabyBear],
+        in_rows: usize,
+        in_cols: usize,
+        out_height: usize,
+        elem_size: usize,
+    ) -> RowMajorMatrix<BabyBear> {
+        let out_width_words = in_rows * elem_size;
+        let total_out = out_height * out_width_words;
+
+        let opts = MTLResourceOptions::StorageModeShared;
+        let src_buf = self.device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            (data.len() * size_of::<u32>()) as u64,
+            opts,
+        );
+        let dst_buf = self.device.new_buffer(
+            (total_out * size_of::<u32>()) as u64,
+            opts,
+        );
+
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.transpose_pad_ps);
+        enc.set_buffer(0, Some(&src_buf), 0);
+        enc.set_buffer(1, Some(&dst_buf), 0);
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        set_u32(&enc, 2, in_rows as u32);
+        set_u32(&enc, 3, in_cols as u32);
+        set_u32(&enc, 4, out_height as u32);
+        set_u32(&enc, 5, elem_size as u32);
+
+        let tg = self.transpose_pad_ps.max_total_threads_per_threadgroup() as u64;
+        let tg_w = (in_rows as u64).min(16);
+        let tg_h = (tg / tg_w).min(64);
+        enc.dispatch_threads(
+            metal::MTLSize::new(in_rows as u64, out_height as u64, 1),
+            metal::MTLSize::new(tg_w, tg_h, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut out = vec![BabyBear::ZERO; total_out];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                dst_buf.contents() as *const BabyBear,
+                out.as_mut_ptr(),
+                total_out,
+            );
+        }
+        RowMajorMatrix::new(out, out_width_words)
     }
 
     fn twiddle_buffer(&self, log_n: u32) -> Buffer {
@@ -735,11 +843,11 @@ impl MetalBabyBearDft {
         Vec<usize>,
     )> {
         let log_n = log2_strict_usize(height) as u32;
-        if log_n < self.gpu_min_log_n {
+        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val < 8 * 1024 * 1024 {
+        if total_bytes_val < 8 * 1024 * 1024 || total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
             return None;
         }
 
@@ -824,6 +932,100 @@ impl MetalBabyBearDft {
         if let Some(buf) = natural_buf {
             Self::release_buf(&self.temp_buf_cache, buf);
         }
+        result
+    }
+
+    /// Fused GPU transpose+pad → DFT → Merkle without CPU round-trip.
+    /// Input is raw polynomial data (untransposed), output is the transposed
+    /// DFT result in `out_values` plus Merkle digest layers.
+    pub fn gpu_transpose_dft_and_merkle(
+        &self,
+        data: &[BabyBear],
+        in_rows: usize,
+        in_cols: usize,
+        out_height: usize,
+        elem_size: usize,
+    ) -> Option<(
+        Vec<BabyBear>,
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        Vec<Vec<[BabyBear; 8]>>,
+        Vec<usize>,
+    )> {
+        let out_width = in_rows * elem_size;
+        let total_out = out_height * out_width;
+        let log_n = log2_strict_usize(out_height) as u32;
+
+        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
+            return None;
+        }
+        let total_bytes_val = total_out * size_of::<u32>();
+        if total_bytes_val < 8 * 1024 * 1024 || total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
+            return None;
+        }
+
+        let total_bytes = total_bytes_val as u64;
+        let tw = self.twiddle_buffer(log_n);
+
+        let dif_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
+        let natural_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
+
+        // Transpose+pad directly into the GPU buffer (shared memory on Apple Silicon).
+        // This avoids allocating a separate src buffer and a GPU transpose kernel.
+        {
+            let dst_slice = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dif_buf.contents() as *mut BabyBear, total_out,
+                )
+            };
+            dst_slice.fill(BabyBear::ZERO);
+            let src_slice = data;
+            dst_slice.par_chunks_mut(out_width).take(in_cols).enumerate().for_each(|(out_row, row)| {
+                for out_col in 0..in_rows {
+                    let src_base = (out_col * in_cols + out_row) * elem_size;
+                    let dst_offset = out_col * elem_size;
+                    for d in 0..elem_size {
+                        row[dst_offset + d] = src_slice[src_base + d];
+                    }
+                }
+            });
+        }
+
+        let result = autoreleasepool(|| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            self.encode_dif_stages_only(&enc, &dif_buf, &tw,
+                log_n, out_height as u32, out_width as u32);
+
+            self.encode_bitrev_gather(&enc, &dif_buf, &natural_buf,
+                out_height as u32, out_width as u32, log_n);
+
+            let merkle_layers = self.encode_merkle_tree(
+                &enc, &natural_buf, out_height as u32, out_width as u32,
+            );
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if cmd.status() == MTLCommandBufferStatus::Error {
+                return None;
+            }
+
+            let mut out_values = vec![BabyBear::ZERO; total_out];
+            unsafe {
+                fast_memcpy_from_gpu(
+                    out_values.as_mut_ptr().cast::<u8>(),
+                    natural_buf.contents() as *const u8,
+                    total_bytes as usize,
+                );
+            }
+
+            let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle_layers);
+            Some((out_values, cap, digest_layers, arity_schedule))
+        });
+
+        Self::release_buf(&self.data_buf_cache, dif_buf);
+        Self::release_buf(&self.temp_buf_cache, natural_buf);
         result
     }
 
@@ -1100,11 +1302,11 @@ impl MetalBabyBearDft {
 
     fn try_gpu_dft_inplace(&self, values: &mut Vec<BabyBear>, height: usize, width: usize) -> Option<()> {
         let log_n = log2_strict_usize(height) as u32;
-        if log_n < self.gpu_min_log_n {
+        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val < 8 * 1024 * 1024 {
+        if total_bytes_val < 8 * 1024 * 1024 || total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
             return None;
         }
 
@@ -2283,6 +2485,48 @@ where
                 Err(RowMajorMatrix::new(ef_values, init_width))
             }
         }
+    }
+
+    fn transpose_pad_dft_and_commit(
+        &self,
+        data: &[BabyBear],
+        in_rows: usize,
+        in_cols: usize,
+        padded_height: usize,
+    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>)> {
+        let (values, cap, digest_layers, arity_schedule) =
+            self.gpu.gpu_transpose_dft_and_merkle(data, in_rows, in_cols, padded_height, 1)?;
+        let mat = RowMajorMatrix::new(values, in_rows);
+        let tree = p3_merkle_tree::MerkleTree::from_parts(
+            vec![mat], digest_layers, arity_schedule,
+        );
+        Some((cap, tree))
+    }
+
+    fn transpose_pad_dft_algebra_and_commit<EF>(
+        &self,
+        data: &[EF],
+        in_rows: usize,
+        in_cols: usize,
+        padded_height: usize,
+    ) -> Option<(
+        Self::Commitment,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+    )>
+    where
+        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+    {
+        let d = EF::DIMENSION;
+        let base_data = EF::flatten_to_base(data.to_vec());
+        let (values, cap, digest_layers, arity_schedule) =
+            self.gpu.gpu_transpose_dft_and_merkle(&base_data, in_rows, in_cols, padded_height, d)?;
+        let ef_values = EF::reconstitute_from_base(values);
+        let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
+        let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
+        let tree = p3_merkle_tree::MerkleTree::from_parts(
+            vec![flat_view], digest_layers, arity_schedule,
+        );
+        Some((cap, tree))
     }
 }
 

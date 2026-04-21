@@ -1777,6 +1777,39 @@ Bb bb_halve(Bb a) {
     return Bb{(v & 1u) ? ((v >> 1) + ((BB_P >> 1) + 1)) : (v >> 1)};
 }
 
+// ── Transpose + zero-pad ─────────────────────────────────────────────
+// Transposes an [in_rows × in_cols] matrix of multi-word elements into
+// an [out_rows × in_rows] matrix, zero-padding rows beyond in_cols.
+// `elem_size` is the number of Bb words per logical element (1 for base
+// field, 4 for quartic extension field).
+// Each thread handles one logical element of the output.
+kernel void bb_transpose_pad(
+    device const Bb* src       [[buffer(0)]],
+    device Bb* dst             [[buffer(1)]],
+    constant uint& in_rows     [[buffer(2)]],
+    constant uint& in_cols     [[buffer(3)]],
+    constant uint& out_rows    [[buffer(4)]],
+    constant uint& elem_size   [[buffer(5)]],
+    uint2 gid                  [[thread_position_in_grid]]
+) {
+    uint out_col = gid.x;
+    uint out_row = gid.y;
+    if (out_col >= in_rows || out_row >= out_rows) return;
+
+    uint dst_base = (out_row * in_rows + out_col) * elem_size;
+
+    if (out_row < in_cols) {
+        uint src_base = (out_col * in_cols + out_row) * elem_size;
+        for (uint d = 0; d < elem_size; d++) {
+            dst[dst_base + d] = src[src_base + d];
+        }
+    } else {
+        for (uint d = 0; d < elem_size; d++) {
+            dst[dst_base + d] = Bb{0};
+        }
+    }
+}
+
 Bb bb_sbox(Bb x) {
     Bb x2 = bb_mul(x, x);
     Bb x3 = bb_mul(x2, x);
@@ -1941,30 +1974,24 @@ kernel void poseidon2_merkle_compress(
 // Each thread tries one candidate nonce, applies Poseidon2 permutation,
 // and checks whether the output satisfies the PoW condition.
 
-// Convert canonical u32 → Montgomery form:  (x * 2^32) mod P
-// Uses the identity: to_monty(x) = monty_reduce(x * R²), where
-// R² mod P is passed as a constant.
 Bb bb_from_canonical(uint x, Bb r_squared) {
     return bb_mul(Bb{x}, r_squared);
 }
 
-// Convert Montgomery form → canonical u32:  monty_reduce(m)
-// Equivalent to bb_mul(x, Bb{1}).v — uses the same subtraction-based REDC.
 uint bb_to_canonical(Bb x) {
     uint t = x.v * BB_MONTY_MU;
     uint u_hi = mulhi(t, BB_P);
-    // x_hi = 0 (since x.v is 32-bit, mulhi(x.v, 1) = 0)
     return u_hi == 0u ? 0u : BB_P - u_hi;
 }
 
 kernel void poseidon2_pow_grind(
-    constant uint*        base_state    [[buffer(0)]],   // 16 u32s (Montgomery form)
-    constant Bb*          rc            [[buffer(1)]],   // Poseidon2 round constants
+    constant uint*        base_state    [[buffer(0)]],
+    constant Bb*          rc            [[buffer(1)]],
     constant uint&        witness_idx   [[buffer(2)]],
     constant uint&        pow_bits      [[buffer(3)]],
-    constant uint&        r_squared     [[buffer(4)]],   // R² mod P (raw u32)
-    device atomic_uint*   result        [[buffer(5)]],   // output: winning nonce (canonical)
-    device atomic_uint*   found         [[buffer(6)]],   // flag: 0 → not yet found
+    constant uint&        r_squared     [[buffer(4)]],
+    device atomic_uint*   result        [[buffer(5)]],
+    device atomic_uint*   found         [[buffer(6)]],
     constant uint&        nonce_offset  [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {

@@ -485,33 +485,42 @@ where
         let folding_factor_next = self.folding_factor.at_round(round_index + 1);
         let inv_rate = self.inv_rate(round_index);
 
-        let padded = info_span!("transpose & pad").in_scope(|| {
-            let num_vars = folded_evaluations.num_vars();
-            let mut mat = RowMajorMatrixView::new(
-                folded_evaluations.as_slice(),
-                1 << (num_vars - folding_factor_next),
-            )
-            .transpose();
-            mat.pad_to_height(inv_rate * (1 << (num_vars - folding_factor_next)), EF::ZERO);
-            mat
-        });
+        let num_vars = folded_evaluations.num_vars();
+        let in_cols_ef = 1 << (num_vars - folding_factor_next);
+        let in_rows_ef = 1 << folding_factor_next;
+        let padded_height = inv_rate * in_cols_ef;
 
-        // Try fused DFT+Merkle in a single GPU command buffer.
-        // Falls back to separate DFT + ExtensionMmcs::commit if fusion fails
-        // (e.g., matrix too small for GPU benefit).
-        let (root, prover_data) = match info_span!("fused_dft_algebra_commit")
-            .in_scope(|| self.mmcs.dft_algebra_and_commit(padded))
-        {
-            Ok((root, prover_data)) => (root, prover_data),
-            Err(padded) => {
-                let folded_matrix =
-                    info_span!("dft", height = padded.height(), width = padded.width())
-                        .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
-                let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
-                info_span!("commit matrix")
-                    .in_scope(|| extension_mmcs.commit_matrix(folded_matrix))
-            }
-        };
+        let (root, prover_data) =
+            if let Some(result) = info_span!("fused_transpose_dft_algebra_commit").in_scope(|| {
+                self.mmcs.transpose_pad_dft_algebra_and_commit(
+                    folded_evaluations.as_slice(), in_rows_ef, in_cols_ef, padded_height,
+                )
+            }) {
+                result
+            } else {
+                let padded = info_span!("transpose & pad").in_scope(|| {
+                    let mut mat = RowMajorMatrixView::new(
+                        folded_evaluations.as_slice(), in_cols_ef,
+                    )
+                    .transpose();
+                    mat.pad_to_height(padded_height, EF::ZERO);
+                    mat
+                });
+
+                match info_span!("fused_dft_algebra_commit")
+                    .in_scope(|| self.mmcs.dft_algebra_and_commit(padded))
+                {
+                    Ok((root, prover_data)) => (root, prover_data),
+                    Err(padded) => {
+                        let folded_matrix =
+                            info_span!("dft", height = padded.height(), width = padded.width())
+                                .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
+                        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
+                        info_span!("commit matrix")
+                            .in_scope(|| extension_mmcs.commit_matrix(folded_matrix))
+                        }
+                }
+            };
 
         let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
 

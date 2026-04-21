@@ -115,30 +115,40 @@ where
         Dft: TwoAdicSubgroupDft<F>,
         Challenger: CanObserve<MT::Commitment>,
     {
-        let padded = info_span!("transpose & pad").in_scope(|| {
-            let num_vars = statement.num_variables();
-            let mut mat = RowMajorMatrixView::new(
-                statement.poly.as_slice(),
-                1 << (num_vars - self.folding_factor.at_round(0)),
-            )
-            .transpose();
-            mat.pad_to_height(
-                1 << (num_vars + self.starting_log_inv_rate - self.folding_factor.at_round(0)),
-                F::ZERO,
-            );
-            mat
-        });
+        let num_vars = statement.num_variables();
+        let fold0 = self.folding_factor.at_round(0);
+        let in_cols = 1 << (num_vars - fold0);
+        let in_rows = 1 << fold0;
+        let padded_height = 1 << (num_vars + self.starting_log_inv_rate - fold0);
 
-        let (root, prover_data) = match info_span!("fused_dft_commit")
-            .in_scope(|| self.mmcs.dft_and_commit(padded))
-        {
-            Ok((root, tree)) => (root, tree),
-            Err(padded) => {
-                let folded = info_span!("dft", height = padded.height(), width = padded.width())
-                    .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
-                info_span!("commit_matrix").in_scope(|| self.mmcs.commit_matrix(folded))
-            }
-        };
+        let (root, prover_data) =
+            if let Some(result) = info_span!("fused_transpose_dft_commit").in_scope(|| {
+                self.mmcs.transpose_pad_dft_and_commit(
+                    statement.poly.as_slice(), in_rows, in_cols, padded_height,
+                )
+            }) {
+                result
+            } else {
+                let padded = info_span!("transpose & pad").in_scope(|| {
+                    let mut mat = RowMajorMatrixView::new(
+                        statement.poly.as_slice(), in_cols,
+                    )
+                    .transpose();
+                    mat.pad_to_height(padded_height, F::ZERO);
+                    mat
+                });
+
+                match info_span!("fused_dft_commit")
+                    .in_scope(|| self.mmcs.dft_and_commit(padded))
+                {
+                    Ok((root, tree)) => (root, tree),
+                    Err(padded) => {
+                        let folded = info_span!("dft", height = padded.height(), width = padded.width())
+                            .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
+                        info_span!("commit_matrix").in_scope(|| self.mmcs.commit_matrix(folded))
+                    }
+                }
+            };
 
         proof.initial_commitment = Some(root.clone());
         challenger.observe(root);
