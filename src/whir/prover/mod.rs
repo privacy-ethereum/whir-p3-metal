@@ -4,10 +4,10 @@ use core::ops::Deref;
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::{ExtensionMmcs, Mmcs};
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_field::{BasedVectorSpace, ExtensionField, Field, TwoAdicField};
 use p3_matrix::{
     Matrix,
-    dense::{DenseMatrix, RowMajorMatrixView},
+    dense::{DenseMatrix, RowMajorMatrix, RowMajorMatrixView},
     extension::FlatMatrixView,
 };
 use p3_multilinear_util::{point::Point, poly::Poly};
@@ -409,6 +409,207 @@ where {
             );
             proof.set_final_sumcheck_data(sumcheck_data);
         }
+
+        Ok(())
+    }
+}
+
+/// Fused DFT+Merkle round path for GPU-accelerated MMCS types.
+#[cfg(feature = "gpu-metal")]
+impl<EF, F, MT, Challenger> Prover<'_, EF, F, MT, Challenger>
+where
+    F: TwoAdicField + Ord,
+    EF: ExtensionField<F> + TwoAdicField + BasedVectorSpace<F> + Clone + Send + Sync,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    MT: crate::gpu_dft::DftCommitFusion<F>,
+{
+    #[instrument(skip_all)]
+    pub fn prove_fused<Dft>(
+        &self,
+        dft: &Dft,
+        proof: &mut WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        statement: &InitialStatement<F, EF>,
+        prover_data: MT::ProverData<DenseMatrix<F>>,
+    ) -> Result<(), FiatShamirError>
+    where
+        Dft: TwoAdicSubgroupDft<F>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        assert!(self.validate_parameters(), "Invalid prover parameters");
+
+        let mut round_state = RoundState::initialize_first_round_state(
+            &mut proof.initial_sumcheck,
+            challenger,
+            statement,
+            prover_data,
+            self.folding_factor.at_round(0),
+            self.starting_folding_pow_bits,
+        )?;
+
+        for round in 0..=self.n_rounds() {
+            self.round_fused(dft, round, proof, challenger, &mut round_state)?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(round_number = round_index, log_size = self.num_variables - self.folding_factor.total_number(round_index)))]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::type_complexity)]
+    fn round_fused<Dft: TwoAdicSubgroupDft<F>>(
+        &self,
+        dft: &Dft,
+        round_index: usize,
+        proof: &mut WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        round_state: &mut RoundState<
+            EF,
+            F,
+            MT::ProverData<DenseMatrix<F>>,
+            MT::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+        >,
+    ) -> Result<(), FiatShamirError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let folded_evaluations = &round_state.sumcheck_prover.evals();
+        let num_variables = self.num_variables - self.folding_factor.total_number(round_index);
+        assert_eq!(num_variables, folded_evaluations.num_vars());
+
+        if round_index == self.n_rounds() {
+            return self.final_round(round_index, proof, challenger, round_state);
+        }
+
+        let round_params = &self.round_parameters[round_index];
+        let folding_factor_next = self.folding_factor.at_round(round_index + 1);
+        let inv_rate = self.inv_rate(round_index);
+
+        let padded = info_span!("transpose & pad").in_scope(|| {
+            let num_vars = folded_evaluations.num_vars();
+            let mut mat = RowMajorMatrixView::new(
+                folded_evaluations.as_slice(),
+                1 << (num_vars - folding_factor_next),
+            )
+            .transpose();
+            mat.pad_to_height(inv_rate * (1 << (num_vars - folding_factor_next)), EF::ZERO);
+            mat
+        });
+
+        // Try fused DFT+Merkle in a single GPU command buffer.
+        // Falls back to separate DFT + ExtensionMmcs::commit if fusion fails
+        // (e.g., matrix too small for GPU benefit).
+        let (root, prover_data) = match info_span!("fused_dft_algebra_commit")
+            .in_scope(|| self.mmcs.dft_algebra_and_commit(padded))
+        {
+            Ok((root, prover_data)) => (root, prover_data),
+            Err(padded) => {
+                let folded_matrix =
+                    info_span!("dft", height = padded.height(), width = padded.width())
+                        .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
+                let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
+                info_span!("commit matrix")
+                    .in_scope(|| extension_mmcs.commit_matrix(folded_matrix))
+            }
+        };
+
+        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
+
+        challenger.observe(root.clone());
+        proof.rounds[round_index].commitment = Some(root);
+
+        let mut ood_statement = EqStatement::initialize(num_variables);
+        let mut ood_answers = Vec::with_capacity(round_params.ood_samples);
+        (0..round_params.ood_samples).for_each(|_| {
+            let point =
+                Point::expand_from_univariate(challenger.sample_algebra_element(), num_variables);
+            let eval = round_state.sumcheck_prover.eval(&point);
+            challenger.observe_algebra_element(eval);
+            ood_answers.push(eval);
+            ood_statement.add_evaluated_constraint(point, eval);
+        });
+        proof.rounds[round_index].ood_answers = ood_answers;
+
+        if round_params.pow_bits > 0 {
+            proof.rounds[round_index].pow_witness = challenger.grind(round_params.pow_bits);
+        }
+
+        challenger.sample();
+
+        let stir_challenges_indexes = get_challenge_stir_queries::<Challenger, F, EF>(
+            round_params.domain_size,
+            self.folding_factor.at_round(round_index),
+            round_params.num_queries,
+            challenger,
+        )?;
+
+        let stir_vars = stir_challenges_indexes
+            .iter()
+            .map(|&i| round_params.folded_domain_gen.exp_u64(i as u64))
+            .collect::<Vec<_>>();
+
+        let mut stir_statement = SelectStatement::initialize(num_variables);
+        let mut queries = Vec::with_capacity(stir_challenges_indexes.len());
+
+        match &round_state.merkle_prover_data {
+            None => {
+                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
+                for challenge in &stir_challenges_indexes {
+                    let commitment = self
+                        .mmcs
+                        .open_batch(*challenge, &round_state.commitment_merkle_prover_data);
+                    let answer = commitment.opened_values[0].clone();
+                    answers.push(answer.clone());
+                    queries.push(QueryOpening::Base {
+                        values: answer.clone(),
+                        proof: commitment.opening_proof,
+                    });
+                }
+                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                    let evals = Poly::new(answer.clone());
+                    let eval = evals.eval_base(&round_state.folding_randomness);
+                    stir_statement.add_constraint(var, eval);
+                }
+            }
+            Some(data) => {
+                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
+                for challenge in &stir_challenges_indexes {
+                    let commitment = extension_mmcs.open_batch(*challenge, data);
+                    let answer = commitment.opened_values[0].clone();
+                    answers.push(answer.clone());
+                    queries.push(QueryOpening::Extension {
+                        values: answer.clone(),
+                        proof: commitment.opening_proof,
+                    });
+                }
+                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                    let evals = Poly::new(answer.clone());
+                    let eval = evals.eval_ext::<F>(&round_state.folding_randomness);
+                    stir_statement.add_constraint(var, eval);
+                }
+            }
+        }
+
+        proof.rounds[round_index].queries = queries;
+
+        let constraint = Constraint::new(
+            challenger.sample_algebra_element(),
+            ood_statement,
+            stir_statement,
+        );
+
+        let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
+        let folding_randomness = round_state.sumcheck_prover.compute_sumcheck_polynomials(
+            &mut sumcheck_data,
+            challenger,
+            folding_factor_next,
+            round_params.folding_pow_bits,
+            Some(constraint),
+        );
+        proof.set_sumcheck_data_at(sumcheck_data, round_index);
+
+        round_state.folding_randomness = folding_randomness;
+        round_state.merkle_prover_data = Some(prover_data);
 
         Ok(())
     }

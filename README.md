@@ -37,15 +37,20 @@ within a compute command encoder, so no explicit barriers are needed.
 
 **3. Fused DFT → Merkle pipeline (`DftCommitFusion` trait)**
 
-The biggest optimization: instead of running DFT on GPU, copying the result
-back to CPU, and re-uploading for Merkle hashing, the fused path runs
-DFT + bit-reversal + Poseidon2 leaf hashing + all Merkle compression layers
-in a **single GPU command buffer** with zero CPU round-trips between stages.
+Instead of running DFT on GPU, copying the result back to CPU, and
+re-uploading for Merkle hashing, the fused path runs DFT + bit-reversal +
+Poseidon2 leaf hashing + all Merkle compression layers in a **single GPU
+command buffer** with zero CPU round-trips between stages.
 
 This is exposed via the `DftCommitFusion<F>` trait, which `GpuMmcs`
-implements. The committer's `commit_fused()` method tries the fused path
-first and falls back to separate DFT + commit if the matrix is too small for
-GPU benefit (threshold: 64 MB).
+implements. The fusion is used in two places:
+
+1. **Initial commit** — `CommitmentWriter::commit_fused()` fuses the base-field
+   DFT + Merkle for the initial polynomial commitment.
+2. **Per-round commits** — `Prover::prove_fused()` fuses the extension-field
+   DFT (`dft_algebra_batch`) + Merkle for every STIR round that has a large
+   enough matrix. Falls back to separate DFT + commit when the matrix is
+   below the GPU threshold (64 MB).
 
 The fused pipeline for a single commit:
 
@@ -73,48 +78,52 @@ All benchmarks on Apple M-series silicon (unified memory). Parameters:
 - `n` = `num_variables` (polynomial has 2^n coefficients)
 - `fold` = `folding_factor` (each STIR round folds 2^fold evaluations)
 - `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate, domain = 2^(n+rate) points)
-- Speedup = CPU time / GPU time
+- **GPU** = fused initial commit only (rounds use separate DFT + commit)
+- **Fused** = fused initial commit + fused per-round DFT+Merkle (`prove_fused`)
+- Speedup = CPU time / GPU or Fused time
 
 #### Parameter sweep — n=22 (4M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Speedup |
-|------|------|----------|----------|---------|
-| 4 | 1 | 182 | 201 | 0.91x |
-| 4 | 2 | 385 | 284 | **1.35x** |
-| 4 | 3 | 818 | 579 | **1.41x** |
-| **6** | **1** | **265** | **142** | **1.87x** |
-| **6** | **2** | **911** | **491** | **1.86x** |
-| 8 | 1 | 125 | 98 | **1.28x** |
-| 8 | 2 | 210 | 135 | **1.55x** |
-| 8 | 3 | 405 | 327 | **1.24x** |
-| 10 | 1 | 140 | 112 | **1.26x** |
-| 10 | 3 | 1696 | 1500 | **1.13x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
+|------|------|----------|----------|------------|-------------|---------------|
+| 4 | 1 | 167 | 165 | 176 | 1.01x | 0.95x |
+| 4 | 2 | 379 | 260 | 277 | **1.46x** | **1.37x** |
+| 4 | 3 | 731 | 671 | 622 | 1.09x | **1.17x** |
+| 6 | 1 | 142 | 133 | 146 | 1.07x | 0.98x |
+| 6 | 2 | 421 | 379 | 363 | 1.11x | **1.16x** |
+| 6 | 3 | 2723 | 1715 | 2380 | **1.59x** | 1.14x |
+| 8 | 1 | 93 | 95 | 96 | 0.98x | 0.97x |
+| 8 | 2 | 189 | 139 | 155 | **1.36x** | **1.22x** |
+| 8 | 3 | 444 | 328 | **283** | 1.35x | **1.57x** |
+| 10 | 1 | 125 | 116 | 114 | 1.08x | **1.10x** |
 
 #### Parameter sweep — n=24 (16M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Speedup |
-|------|------|----------|----------|---------|
-| 4 | 1 | 982 | 921 | **1.07x** |
-| 4 | 2 | 5034 | 3651 | **1.38x** |
-| 6 | 1 | 579 | 488 | **1.19x** |
-| 6 | 2 | 2221 | 2005 | **1.11x** |
-| 6 | 3 | 11844 | 8539 | **1.39x** |
-| 7 | 1 | 2438 | 2070 | **1.18x** |
-| 8 | 1 | 40070 | 35668 | **1.12x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
+|------|------|----------|----------|------------|-------------|---------------|
+| **4** | **1** | **1142** | **939** | **727** | **1.22x** | **1.57x** |
+| **6** | **1** | **704** | **484** | **432** | **1.45x** | **1.63x** |
+| **10** | **1** | **491** | fail | **351** | - | **1.40x** |
 
 #### Observations
 
-- **Best GPU speedup: fold=6 at rate 1-2** — consistently 1.8-1.9x for n=22.
-  Fold=6 produces moderately large DFTs (2^16-2^18 rows) that fully saturate
-  GPU parallelism while keeping the number of STIR rounds manageable.
-- **Higher rates amplify GPU advantage** (larger domain → more GPU-friendly
-  work), but rates above 3 make both CPU and GPU very slow.
-- **GPU loses when data < 64 MB** — the fused pipeline skips GPU and falls
-  back to CPU automatically (see threshold in `gpu_dft_and_merkle`).
+- **Round fusion matters at n=24.** The fused round path (`prove_fused`)
+  adds 0.2–0.4x additional speedup over commit-only fusion on larger
+  polynomials. At n=24 fold=4 rate=1, fusion improves from 1.22x to 1.57x.
+- **Best overall speedup: n=24, fold=6, rate=1 at 1.63x** with full fusion.
+  The round DFT matrices at this config are large enough (>64 MB) for the
+  GPU fusion to kick in during STIR rounds.
+- **Round fusion wins when round matrices are large.** At n=22 fold=8 rate=3,
+  the round matrix is large enough for GPU fusion, yielding 1.57x (fused)
+  vs 1.35x (commit-only).
+- **Round fusion can hurt on small round matrices.** At n=22 fold=6 rate=3,
+  the fused path (1.14x) underperforms commit-only (1.59x) because the
+  round DFTs are borderline size and the fusion overhead dominates.
+- **GPU loses at very small data (<64 MB)** — the pipeline automatically
+  falls back to CPU.
 - **Folding factors ≥ 12 are untested on GPU** — they trigger Metal driver
   instability (kernel panics) on some Apple Silicon configurations.
-- The GPU pipeline is most beneficial when the initial commit DFT processes
-  2^16 to 2^21 rows with total data between 64 MB and 256 MB.
+- GPU domain size is capped at 2^25 to avoid Metal driver crashes.
 
 #### Running benchmarks
 
@@ -122,6 +131,7 @@ All benchmarks on Apple M-series silicon (unified memory). Parameters:
 # Full whir_prove benchmark (default config: n=24, fold=4, rate=1)
 cargo bench --features gpu-metal --bench dft_gpu -- "whir_prove"
 
-# Parameter sweep (writes results to sweep_results.txt)
+# Parameter sweep comparing CPU / GPU / GPU+fused rounds
+# (writes results to sweep_results.txt)
 cargo run --release --features gpu-metal --bin sweep
 ```

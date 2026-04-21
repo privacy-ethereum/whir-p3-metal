@@ -89,7 +89,7 @@ fn run_cpu(n: usize, f: usize, r: usize) -> Option<f64> {
     result.ok()
 }
 
-fn run_gpu(n: usize, f: usize, r: usize) -> Option<f64> {
+fn run_gpu(n: usize, f: usize, r: usize, fuse_rounds: bool) -> Option<f64> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rng = SmallRng::seed_from_u64(1);
         let perm = Perm::new_from_rng_128(&mut rng);
@@ -140,7 +140,11 @@ fn run_gpu(n: usize, f: usize, r: usize) -> Option<f64> {
             let comm = CommitmentWriter::new(&params);
             let mut s = initial_statement.clone();
             let pd = comm.commit_fused(&dft, &mut proof, &mut ch, &mut s).unwrap();
-            Prover(&params).prove(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            if fuse_rounds {
+                Prover(&params).prove_fused(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            } else {
+                Prover(&params).prove(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            }
         }
 
         let mut times = Vec::new();
@@ -152,7 +156,11 @@ fn run_gpu(n: usize, f: usize, r: usize) -> Option<f64> {
             let comm = CommitmentWriter::new(&params);
             let mut s = initial_statement.clone();
             let pd = comm.commit_fused(&dft, &mut proof, &mut ch, &mut s).unwrap();
-            Prover(&params).prove(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            if fuse_rounds {
+                Prover(&params).prove_fused(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            } else {
+                Prover(&params).prove(&dft, &mut proof, &mut ch, &s, pd).unwrap();
+            }
             times.push(t0.elapsed().as_secs_f64());
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -172,7 +180,8 @@ fn main() {
         let mode = &args[4];
         let result = match mode.as_str() {
             "cpu" => run_cpu(n, f, r),
-            "gpu" => run_gpu(n, f, r),
+            "gpu" => run_gpu(n, f, r, false),
+            "gpu_fused" => run_gpu(n, f, r, true),
             _ => None,
         };
         match result {
@@ -200,8 +209,8 @@ fn main() {
     }
 
     let mut configs: Vec<(usize, usize, usize)> = Vec::new();
-    let folds = &[4, 6, 8, 10, 12, 14, 16];
-    let rates = &[1, 2, 3, 4, 6, 8, 10, 12, 14, 16];
+    let folds = &[4, 6, 8, 10];
+    let rates = &[1, 2, 3];
     for &n in &[22, 24] {
         for &f in folds {
             for &r in rates {
@@ -211,20 +220,15 @@ fn main() {
         }
     }
 
-    // GPU memory safety limit: total domain = 2^(n+r) elements.
-    // Each element is 4 bytes; DFT needs ~3x (in + out + merkle).
-    // Hard cap at n+r <= 25 (128 MB domain, ~384 MB GPU total).
-    // This avoids the Metal kernel panics that crashed the system.
     let max_log_domain_gpu: usize = 25;
     let max_cpu_secs = 15.0;
 
     let header = format!(
-        "{:<6} {:<6} {:<6} {:>10} {:>10} {:>8}  {}",
-        "n", "fold", "rate", "CPU(ms)", "GPU(ms)", "speedup", "notes"
+        "{:<6} {:<6} {:<6} {:>10} {:>10} {:>10} {:>8} {:>8}",
+        "n", "fold", "rate", "CPU(ms)", "GPU(ms)", "FUSED(ms)", "gpu/cpu", "fused/cpu"
     );
-    let sep = "-".repeat(70);
+    let sep = "-".repeat(90);
 
-    // Print header (and append to file if starting fresh)
     if done.is_empty() {
         let mut f = std::fs::OpenOptions::new()
             .create(true).append(true).open(results_path).unwrap();
@@ -234,7 +238,6 @@ fn main() {
     println!("{header}");
     println!("{sep}");
 
-    // Print already-done lines
     if let Ok(contents) = std::fs::read_to_string(results_path) {
         for line in contents.lines() {
             if line.starts_with(|c: char| c.is_ascii_digit()) {
@@ -249,14 +252,13 @@ fn main() {
             continue;
         }
 
-        // Log which config we're about to try
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true).append(true).open(results_path).unwrap();
             writeln!(file, "# STARTING n={n} f={f} r={r} ...").unwrap();
         }
 
-        // Run CPU in subprocess
+        // Run CPU
         let cpu_out = std::process::Command::new(exe)
             .args([&n.to_string(), &f.to_string(), &r.to_string(), "cpu"])
             .output();
@@ -270,11 +272,11 @@ fn main() {
         });
 
         let cpu_time = match cpu_time {
-            None => continue,  // invalid config, skip silently
+            None => continue,
             Some(t) if t > max_cpu_secs => {
                 let line = format!(
-                    "{:<6} {:<6} {:<6} {:>10.1} {:>10} {:>8}  CPU too slow",
-                    n, f, r, t * 1000.0, "-", "-"
+                    "{:<6} {:<6} {:<6} {:>10.1} {:>10} {:>10} {:>8} {:>8}  CPU too slow",
+                    n, f, r, t * 1000.0, "-", "-", "-", "-"
                 );
                 println!("{line}");
                 let mut file = std::fs::OpenOptions::new()
@@ -285,12 +287,11 @@ fn main() {
             Some(t) => t,
         };
 
-        // Check GPU memory limit
         let log_domain = n + r;
         if log_domain > max_log_domain_gpu {
             let line = format!(
-                "{:<6} {:<6} {:<6} {:>10.1} {:>10} {:>8}  domain 2^{log_domain} > limit",
-                n, f, r, cpu_time * 1000.0, "-", "-"
+                "{:<6} {:<6} {:<6} {:>10.1} {:>10} {:>10} {:>8} {:>8}  domain 2^{log_domain} > limit",
+                n, f, r, cpu_time * 1000.0, "-", "-", "-", "-"
             );
             println!("{line}");
             let mut file = std::fs::OpenOptions::new()
@@ -299,14 +300,13 @@ fn main() {
             continue;
         }
 
-        // Run GPU in subprocess
-        let gpu_child = std::process::Command::new(exe)
+        // Run GPU (commit fused, rounds NOT fused)
+        let gpu_time = std::process::Command::new(exe)
             .args([&n.to_string(), &f.to_string(), &r.to_string(), "gpu"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        let gpu_time = gpu_child.ok()
+            .spawn()
+            .ok()
             .and_then(|c| c.wait_with_output().ok())
             .and_then(|o| {
                 if o.status.success() {
@@ -316,21 +316,39 @@ fn main() {
                 }
             });
 
-        let line = match gpu_time {
-            Some(g) => {
-                let speedup = cpu_time / g;
-                format!(
-                    "{:<6} {:<6} {:<6} {:>10.1} {:>10.1} {:>7.2}x",
-                    n, f, r, cpu_time * 1000.0, g * 1000.0, speedup
-                )
-            }
-            None => {
-                format!(
-                    "{:<6} {:<6} {:<6} {:>10.1} {:>10} {:>8}  GPU fail",
-                    n, f, r, cpu_time * 1000.0, "-", "-"
-                )
-            }
-        };
+        // Run GPU (commit fused + rounds fused)
+        let fused_time = std::process::Command::new(exe)
+            .args([&n.to_string(), &f.to_string(), &r.to_string(), "gpu_fused"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()
+            .and_then(|c| c.wait_with_output().ok())
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()?.trim().parse::<f64>().ok()
+                } else {
+                    None
+                }
+            });
+
+        let gpu_str = gpu_time
+            .map(|g| format!("{:>10.1}", g * 1000.0))
+            .unwrap_or_else(|| format!("{:>10}", "fail"));
+        let fused_str = fused_time
+            .map(|g| format!("{:>10.1}", g * 1000.0))
+            .unwrap_or_else(|| format!("{:>10}", "fail"));
+        let gpu_speedup = gpu_time
+            .map(|g| format!("{:>7.2}x", cpu_time / g))
+            .unwrap_or_else(|| format!("{:>8}", "-"));
+        let fused_speedup = fused_time
+            .map(|g| format!("{:>7.2}x", cpu_time / g))
+            .unwrap_or_else(|| format!("{:>8}", "-"));
+
+        let line = format!(
+            "{:<6} {:<6} {:<6} {:>10.1} {} {} {} {}",
+            n, f, r, cpu_time * 1000.0, gpu_str, fused_str, gpu_speedup, fused_speedup
+        );
 
         println!("{line}");
         let mut file = std::fs::OpenOptions::new()
