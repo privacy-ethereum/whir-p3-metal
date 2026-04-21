@@ -2,6 +2,18 @@
 // All kernels work on ROW-MAJOR matrices: data[row * width + col].
 // A single dispatch handles all columns — no CPU transpose needed.
 //
+// GPU/CPU speedup (best per n, across fold ∈ {1-8}, rate ∈ {1-3}):
+//
+//        │ Opt 1  │ Opt 2  │ Opt 3  │ Opt 4  │ Opt 5  │ Opt 6  │ Opt 7  │
+//   n    │GPU NTT │Radix-16│+Merkle │+Fused  │+Rounds │+Thresh │+Grind  │
+//   ─────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+//   18   │ 1.08x  │ 1.08x  │ 0.99x  │ 0.95x  │ 0.91x  │ 0.98x  │ 0.99x  │
+//   20   │ 0.97x  │ 1.01x  │ 1.19x  │ 1.25x  │ 1.26x  │ 1.40x  │ 1.49x  │
+//   22   │ 1.09x  │ 1.46x  │ 2.04x  │ 2.18x  │ 2.10x  │ 2.33x  │ 2.24x  │
+//   24   │ 1.24x  │ 1.37x  │ 1.91x  │ 1.94x  │ 2.04x  │ 2.08x  │ 2.58x  │
+//
+// Full per-parameter tables: docs/gpu-optimizations.md
+//
 // ┌─────────────────────────────┬──────┬─────────────────────────────────────────┐
 // │ Kernel                      │ Line │ Purpose                                 │
 // ├─────────────────────────────┼──────┼─────────────────────────────────────────┤
