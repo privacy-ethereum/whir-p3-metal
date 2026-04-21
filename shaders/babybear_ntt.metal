@@ -692,6 +692,187 @@ kernel void bb_ntt_stockham(
     }
 }
 
+// ── Stockham radix-4 with gather/scatter I/O (for four-step FFT) ────
+// Like bb_ntt_stockham but reads from `input` and writes to `output`
+// using configurable row strides, enabling the four-step FFT decomposition.
+//
+// load_stride = 1  → contiguous: row(i) = tgid * block_size + i
+// load_stride > 1  → gather:     row(i) = tgid + i * load_stride
+// store_stride = 1 → contiguous: row(i) = tgid * block_size + i
+// store_stride > 1 → scatter:    row(i) = tgid + i * store_stride
+//
+// When apply_twiddle != 0, each loaded element is multiplied by
+// ω_N^{tgid * i} where i is the element's position within the block.
+// This fuses the inter-block twiddle of the Cooley-Tukey four-step.
+kernel void bb_ntt_stockham_gs(
+    device const Bb* input          [[buffer(0)]],
+    device Bb* output               [[buffer(1)]],
+    device const Bb* twiddles       [[buffer(2)]],
+    constant uint& height           [[buffer(3)]],
+    constant uint& width            [[buffer(4)]],
+    constant uint& log_block        [[buffer(5)]],
+    constant uint& load_stride      [[buffer(6)]],
+    constant uint& store_stride     [[buffer(7)]],
+    constant uint& apply_twiddle    [[buffer(8)]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup Bb sdata[8192];
+
+    uint block_size = 1u << log_block;
+    uint quarter    = block_size >> 2;   // = tg_size
+    uint tile_w     = min(8u, 8192 / block_size);
+    uint n_passes   = log_block >> 1;
+    uint half_height = height >> 1;
+
+    Bb omega_4 = twiddles[height >> 2];
+
+    // Precompute twiddle factors for the four elements this thread loads.
+    Bb tw_f[4];
+    bool has_twiddle[4] = {false, false, false, false};
+    if (apply_twiddle) {
+        for (uint j = 0; j < 4; j++) {
+            uint elem = tid + j * quarter;
+            uint tw_raw = tgid * elem;
+            if (tw_raw != 0) {
+                has_twiddle[j] = true;
+                if (tw_raw >= half_height) {
+                    tw_f[j] = bb_neg(twiddles[tw_raw - half_height]);
+                } else {
+                    tw_f[j] = twiddles[tw_raw];
+                }
+            }
+        }
+    }
+
+    for (uint col_base = 0; col_base < width; col_base += tile_w) {
+        uint cw = min(tile_w, width - col_base);
+
+        // ═══ Pass 0: gather from input, optional twiddle, first R4 butterfly ═══
+        for (uint c = 0; c < cw; c++) {
+            uint sm = c * block_size;
+            uint gm = col_base + c;
+
+            Bb r0, r1, r2, r3;
+            if (load_stride == 1) {
+                uint base_row = tgid * block_size;
+                r0 = input[(base_row + tid              ) * width + gm];
+                r1 = input[(base_row + tid +     quarter) * width + gm];
+                r2 = input[(base_row + tid + 2 * quarter) * width + gm];
+                r3 = input[(base_row + tid + 3 * quarter) * width + gm];
+            } else {
+                r0 = input[(tgid + (tid              ) * load_stride) * width + gm];
+                r1 = input[(tgid + (tid +     quarter) * load_stride) * width + gm];
+                r2 = input[(tgid + (tid + 2 * quarter) * load_stride) * width + gm];
+                r3 = input[(tgid + (tid + 3 * quarter) * load_stride) * width + gm];
+            }
+
+            if (apply_twiddle) {
+                if (has_twiddle[0]) r0 = bb_mul(tw_f[0], r0);
+                if (has_twiddle[1]) r1 = bb_mul(tw_f[1], r1);
+                if (has_twiddle[2]) r2 = bb_mul(tw_f[2], r2);
+                if (has_twiddle[3]) r3 = bb_mul(tw_f[3], r3);
+            }
+
+            Bb t0 = bb_add(r0, r2);
+            Bb t1 = bb_sub(r0, r2);
+            Bb t2 = bb_add(r1, r3);
+            Bb t3 = bb_mul(omega_4, bb_sub(r1, r3));
+
+            uint wr = tid << 2;
+            sdata[sm + wr    ] = bb_add(t0, t2);
+            sdata[sm + wr + 1] = bb_add(t1, t3);
+            sdata[sm + wr + 2] = bb_sub(t0, t2);
+            sdata[sm + wr + 3] = bb_sub(t1, t3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ═══ Intermediate radix-4 passes ═══
+        uint stride = 4;
+        for (uint pass = 1; pass < n_passes; pass++) {
+            uint pos = tid & (stride - 1);
+            uint grp = tid / stride;
+            uint tw_step = height / (stride << 2);
+
+            Bb tw1, tw2, tw3;
+            if (pos == 0) {
+                tw1 = Bb{BB_MONTY_ONE};
+                tw2 = Bb{BB_MONTY_ONE};
+                tw3 = Bb{BB_MONTY_ONE};
+            } else {
+                tw1 = twiddles[pos * tw_step];
+                tw2 = bb_mul(tw1, tw1);
+                tw3 = bb_mul(tw2, tw1);
+            }
+
+            uint wr = grp * (stride << 2) + pos;
+
+            for (uint c = 0; c < cw; c++) {
+                uint sm = c * block_size;
+                Bb r0_v = sdata[sm + tid              ];
+                Bb r1_v = sdata[sm + tid +     quarter];
+                Bb r2_v = sdata[sm + tid + 2 * quarter];
+                Bb r3_v = sdata[sm + tid + 3 * quarter];
+
+                r1_v = bb_mul(tw1, r1_v);
+                r2_v = bb_mul(tw2, r2_v);
+                r3_v = bb_mul(tw3, r3_v);
+
+                Bb t0_v = bb_add(r0_v, r2_v);
+                Bb t1_v = bb_sub(r0_v, r2_v);
+                Bb t2_v = bb_add(r1_v, r3_v);
+                Bb t3_v = bb_mul(omega_4, bb_sub(r1_v, r3_v));
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                sdata[sm + wr              ] = bb_add(t0_v, t2_v);
+                sdata[sm + wr +     stride ] = bb_add(t1_v, t3_v);
+                sdata[sm + wr + 2 * stride ] = bb_sub(t0_v, t2_v);
+                sdata[sm + wr + 3 * stride ] = bb_sub(t1_v, t3_v);
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            stride <<= 2;
+        }
+
+        // ═══ Final radix-2 pass (if log_block is odd) ═══
+        if (log_block & 1u) {
+            uint half_block = block_size >> 1;
+            uint tw_step_f = height / block_size;
+
+            for (uint c = 0; c < cw; c++) {
+                uint sm = c * block_size;
+                for (uint pair = 0; pair < 2; pair++) {
+                    uint k = tid + pair * quarter;
+                    Bb r0_v = sdata[sm + k             ];
+                    Bb r1_v = sdata[sm + k + half_block];
+
+                    uint tw_idx = k * tw_step_f;
+                    if (tw_idx != 0) {
+                        r1_v = bb_mul(twiddles[tw_idx], r1_v);
+                    }
+                    sdata[sm + k             ] = bb_add(r0_v, r1_v);
+                    sdata[sm + k + half_block] = bb_sub(r0_v, r1_v);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // ═══ Store tile to output with scatter stride ═══
+        for (uint j = 0; j < 4; j++) {
+            uint elem = tid + j * quarter;
+            uint store_row = (store_stride == 1) ? (tgid * block_size + elem)
+                                                  : (tgid + elem * store_stride);
+            for (uint c = 0; c < cw; c++) {
+                output[store_row * width + col_base + c] =
+                    sdata[c * block_size + elem];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // ── Stockham global radix-2: out-of-place, one stage ────────────────
 // Reads from src, writes to dst.  Both reads and writes are coalesced.
 // p = 2^k where k is the current completed-stage count.

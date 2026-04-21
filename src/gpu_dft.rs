@@ -251,6 +251,7 @@ pub struct MetalBabyBearDft {
     shared_mem_ps: ComputePipelineState,
     shared_mem_gs_ps: ComputePipelineState,
     stockham_ps: ComputePipelineState,
+    stockham_gs_ps: ComputePipelineState,
     stockham_global_r2_ps: ComputePipelineState,
     twiddle_transpose_ps: ComputePipelineState,
     dif_r32_ps: ComputePipelineState,
@@ -371,6 +372,7 @@ impl MetalBabyBearDft {
         let shared_mem_ps = make_ps("bb_ntt_shared_mem");
         let shared_mem_gs_ps = make_ps("bb_ntt_shared_mem_gs");
         let stockham_ps = make_ps("bb_ntt_stockham");
+        let stockham_gs_ps = make_ps("bb_ntt_stockham_gs");
         let stockham_global_r2_ps = make_ps("bb_stockham_global_r2");
         let twiddle_transpose_ps = make_ps("bb_ntt_twiddle_transpose");
         let dif_r32_ps = make_ps("bb_dif_r32");
@@ -432,6 +434,7 @@ impl MetalBabyBearDft {
             shared_mem_ps,
             shared_mem_gs_ps,
             stockham_ps,
+            stockham_gs_ps,
             stockham_global_r2_ps,
             twiddle_transpose_ps,
             dif_r32_ps,
@@ -623,6 +626,10 @@ impl MetalBabyBearDft {
     }
 
     fn use_four_step(&self, _log_n: u32) -> bool {
+        // The four-step FFT has poor memory coalescing for narrow matrices
+        // (width < ~128) because the gather pattern causes each SIMD thread
+        // to access a different cache line. The radix-16 DIF approach is
+        // better for the typical narrow-width NTTs in the WHIR prover.
         false
     }
 
@@ -871,32 +878,62 @@ impl MetalBabyBearDft {
             None
         };
 
+        let use_four_step = self.use_four_step(log_n);
+
         let result = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
 
             if let Some(ref zc_buf) = zc_input {
-                // Zero-copy path: DIF stages read from zc, work on managed
-                self.encode_dif_stages_inplace(&enc, zc_buf, &dif_buf, &tw,
-                    log_n, height as u32, width as u32);
-                // Bitrev gather writes directly back into values (zc_buf)
-                self.encode_bitrev_gather(&enc, &dif_buf, zc_buf,
-                    height as u32, width as u32, log_n);
-                // Merkle hashing reads from zc_buf (= values in natural order)
-                let merkle_layers = self.encode_merkle_tree(
-                    &enc, zc_buf, height as u32, width as u32,
-                );
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-                if cmd.status() == MTLCommandBufferStatus::Error {
-                    return None;
+                if use_four_step {
+                    // Four-step path: zc→temp→zc (natural order), then Merkle
+                    let temp = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
+                    self.encode_four_step_ntt_oop(&enc, zc_buf, zc_buf, &temp, &tw,
+                        log_n, height as u32, width as u32);
+                    let merkle_layers = self.encode_merkle_tree(
+                        &enc, zc_buf, height as u32, width as u32,
+                    );
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    Self::release_buf(&self.temp_buf_cache, temp);
+                    if cmd.status() == MTLCommandBufferStatus::Error {
+                        return None;
+                    }
+                    Some(Self::read_merkle_layers(&merkle_layers))
+                } else {
+                    // DIF path: partial global stages on managed, then shared-
+                    // memory tail + bitrev writes back to zc for Merkle.
+                    let shared_lb = log_n.min(self.max_log_shared_block);
+                    let global_stages = log_n - shared_lb;
+                    if global_stages > 0 {
+                        self.encode_dif_stages_inplace(&enc, zc_buf, &dif_buf, &tw,
+                            global_stages, height as u32, width as u32);
+                        self.dispatch_dif_shared_bitrev(
+                            &enc, &dif_buf, zc_buf, &tw,
+                            height as u32, width as u32, global_stages, log_n, shared_lb,
+                        );
+                    } else {
+                        // Entire NTT fits in shared memory. Need OOP copy
+                        // zc → dif_buf first (shared_bitrev can't work in-place).
+                        self.encode_dif_stages_inplace(&enc, zc_buf, &dif_buf, &tw,
+                            log_n, height as u32, width as u32);
+                        self.encode_bitrev_gather(&enc, &dif_buf, zc_buf,
+                            height as u32, width as u32, log_n);
+                    }
+                    let merkle_layers = self.encode_merkle_tree(
+                        &enc, zc_buf, height as u32, width as u32,
+                    );
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    if cmd.status() == MTLCommandBufferStatus::Error {
+                        return None;
+                    }
+                    Some(Self::read_merkle_layers(&merkle_layers))
                 }
-                // No memcpy needed — values already contains the DFT result
-                Some(Self::read_merkle_layers(&merkle_layers))
             } else {
                 let nat = natural_buf.as_ref().unwrap();
-                // Fallback: CPU memcpy in, DIF in-place, bitrev to natural_buf
                 unsafe {
                     fast_memcpy(
                         dif_buf.contents() as *mut u8,
@@ -904,27 +941,52 @@ impl MetalBabyBearDft {
                         total_bytes as usize,
                     );
                 }
-                self.encode_dif_stages_only(&enc, &dif_buf, &tw,
-                    log_n, height as u32, width as u32);
-                self.encode_bitrev_gather(&enc, &dif_buf, nat,
-                    height as u32, width as u32, log_n);
-                let merkle_layers = self.encode_merkle_tree(
-                    &enc, nat, height as u32, width as u32,
-                );
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-                if cmd.status() == MTLCommandBufferStatus::Error {
-                    return None;
-                }
-                unsafe {
-                    fast_memcpy_from_gpu(
-                        values.as_mut_ptr().cast::<u8>(),
-                        nat.contents() as *const u8,
-                        total_bytes as usize,
+                if use_four_step {
+                    // Four-step in-place on dif_buf, then Merkle
+                    self.encode_four_step_ntt(&enc, &dif_buf, nat, &tw,
+                        log_n, height as u32, width as u32);
+                    let merkle_layers = self.encode_merkle_tree(
+                        &enc, &dif_buf, height as u32, width as u32,
                     );
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    if cmd.status() == MTLCommandBufferStatus::Error {
+                        return None;
+                    }
+                    unsafe {
+                        fast_memcpy_from_gpu(
+                            values.as_mut_ptr().cast::<u8>(),
+                            dif_buf.contents() as *const u8,
+                            total_bytes as usize,
+                        );
+                    }
+                    Some(Self::read_merkle_layers(&merkle_layers))
+                } else {
+                    // DIF+fused bitrev: last DIF stage writes bitrev'd output
+                    // directly to nat, eliminating a separate bitrev pass.
+                    self.encode_dif_ntt(
+                        &enc, &dif_buf, nat, &tw,
+                        log_n, height as u32, width as u32,
+                    );
+                    let merkle_layers = self.encode_merkle_tree(
+                        &enc, nat, height as u32, width as u32,
+                    );
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    if cmd.status() == MTLCommandBufferStatus::Error {
+                        return None;
+                    }
+                    unsafe {
+                        fast_memcpy_from_gpu(
+                            values.as_mut_ptr().cast::<u8>(),
+                            nat.contents() as *const u8,
+                            total_bytes as usize,
+                        );
+                    }
+                    Some(Self::read_merkle_layers(&merkle_layers))
                 }
-                Some(Self::read_merkle_layers(&merkle_layers))
             }
         });
 
@@ -990,38 +1052,62 @@ impl MetalBabyBearDft {
             });
         }
 
+        let use_four_step = self.use_four_step(log_n);
+
         let result = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            self.encode_dif_stages_only(&enc, &dif_buf, &tw,
-                log_n, out_height as u32, out_width as u32);
 
-            self.encode_bitrev_gather(&enc, &dif_buf, &natural_buf,
-                out_height as u32, out_width as u32, log_n);
-
-            let merkle_layers = self.encode_merkle_tree(
-                &enc, &natural_buf, out_height as u32, out_width as u32,
-            );
-
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            if cmd.status() == MTLCommandBufferStatus::Error {
-                return None;
-            }
-
-            let mut out_values = vec![BabyBear::ZERO; total_out];
-            unsafe {
-                fast_memcpy_from_gpu(
-                    out_values.as_mut_ptr().cast::<u8>(),
-                    natural_buf.contents() as *const u8,
-                    total_bytes as usize,
+            if use_four_step {
+                // Four-step: dif_buf → natural_buf (temp) → dif_buf (natural order)
+                self.encode_four_step_ntt(&enc, &dif_buf, &natural_buf, &tw,
+                    log_n, out_height as u32, out_width as u32);
+                let merkle_layers = self.encode_merkle_tree(
+                    &enc, &dif_buf, out_height as u32, out_width as u32,
                 );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                if cmd.status() == MTLCommandBufferStatus::Error {
+                    return None;
+                }
+                let mut out_values = vec![BabyBear::ZERO; total_out];
+                unsafe {
+                    fast_memcpy_from_gpu(
+                        out_values.as_mut_ptr().cast::<u8>(),
+                        dif_buf.contents() as *const u8,
+                        total_bytes as usize,
+                    );
+                }
+                let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle_layers);
+                Some((out_values, cap, digest_layers, arity_schedule))
+            } else {
+                // DIF+fused bitrev: last DIF stage writes bitrev'd result
+                // directly to natural_buf, eliminating a separate bitrev pass.
+                self.encode_dif_ntt(
+                    &enc, &dif_buf, &natural_buf, &tw,
+                    log_n, out_height as u32, out_width as u32,
+                );
+                let merkle_layers = self.encode_merkle_tree(
+                    &enc, &natural_buf, out_height as u32, out_width as u32,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                if cmd.status() == MTLCommandBufferStatus::Error {
+                    return None;
+                }
+                let mut out_values = vec![BabyBear::ZERO; total_out];
+                unsafe {
+                    fast_memcpy_from_gpu(
+                        out_values.as_mut_ptr().cast::<u8>(),
+                        natural_buf.contents() as *const u8,
+                        total_bytes as usize,
+                    );
+                }
+                let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle_layers);
+                Some((out_values, cap, digest_layers, arity_schedule))
             }
-
-            let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle_layers);
-            Some((out_values, cap, digest_layers, arity_schedule))
         });
 
         Self::release_buf(&self.data_buf_cache, dif_buf);
@@ -1184,6 +1270,43 @@ impl MetalBabyBearDft {
         );
     }
 
+    /// Dispatch the shared-memory DIF + bitrev kernel for the tail stages.
+    /// Handles `log_block` DIF stages in shared memory and writes output
+    /// in natural (bit-reversed) order. Out-of-place: src → dst.
+    fn dispatch_dif_shared_bitrev(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &metal::BufferRef,
+        dst: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        start_stage: u32,
+        log_n: u32,
+        log_block: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let block_size = 1u32 << log_block;
+        let half_block = block_size >> 1;
+        let num_blocks = height >> log_block;
+
+        enc.set_compute_pipeline_state(&self.dif_shared_bitrev_ps);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        enc.set_buffer(2, Some(twiddles), 0);
+        set_u32(enc, 3, height);
+        set_u32(enc, 4, width);
+        set_u32(enc, 5, start_stage);
+        set_u32(enc, 6, log_n);
+        set_u32(enc, 7, log_block);
+        enc.dispatch_thread_groups(
+            MTLSize { width: width as u64, height: num_blocks as u64, depth: 1 },
+            MTLSize { width: half_block as u64, height: 1, depth: 1 },
+        );
+    }
+
     /// Encode a bitrev gather: src[bitrev(row)] → dst[row] (coalesced writes).
     fn encode_bitrev_gather(
         &self,
@@ -1312,21 +1435,24 @@ impl MetalBabyBearDft {
 
         let total_bytes = (height * width * size_of::<u32>()) as u64;
         let tw = self.twiddle_buffer(log_n);
+        let use_four_step = self.use_four_step(log_n);
 
-        // Best path: zero-copy wrap values for both input AND output.
-        // 1. First R16 OOP: zc(values) → managed  [reads input from zc]
-        // 2. Remaining DIF: in-place on managed    [fast GPU memory]
-        // 3. Bitrev gather: managed → zc(values)   [coalesced writes back]
-        // No CPU memcpy at all — result lands directly in values.
+        // Try zero-copy: wrap values directly as a Metal buffer.
         if let Some(zc_buf) = self.try_zero_copy_buffer(values, total_bytes) {
             let data_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
             let ok = autoreleasepool(|| {
                 let cmd = self.queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
-                self.encode_dif_ntt_zc(
-                    &enc, &zc_buf, &data_buf, &zc_buf, &tw,
-                    log_n, height as u32, width as u32,
-                );
+                if use_four_step {
+                    // Four-step: zc → temp → zc (natural order)
+                    self.encode_four_step_ntt_oop(&enc, &zc_buf, &zc_buf, &data_buf, &tw,
+                        log_n, height as u32, width as u32);
+                } else {
+                    self.encode_dif_ntt_zc(
+                        &enc, &zc_buf, &data_buf, &zc_buf, &tw,
+                        log_n, height as u32, width as u32,
+                    );
+                }
                 enc.end_encoding();
                 cmd.commit();
                 cmd.wait_until_completed();
@@ -1350,10 +1476,16 @@ impl MetalBabyBearDft {
         let ok = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            self.encode_dif_ntt(
-                &enc, &data_buf, &dst_buf, &tw,
-                log_n, height as u32, width as u32,
-            );
+            if use_four_step {
+                // Four-step in-place on data_buf, using dst_buf as temp
+                self.encode_four_step_ntt(&enc, &data_buf, &dst_buf, &tw,
+                    log_n, height as u32, width as u32);
+            } else {
+                self.encode_dif_ntt(
+                    &enc, &data_buf, &dst_buf, &tw,
+                    log_n, height as u32, width as u32,
+                );
+            }
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -1366,10 +1498,12 @@ impl MetalBabyBearDft {
             return None;
         }
 
+        // Four-step result is in data_buf; DIF result is in dst_buf
+        let src_buf = if use_four_step { &data_buf } else { &dst_buf };
         unsafe {
             fast_memcpy_from_gpu(
                 values.as_mut_ptr().cast::<u8>(),
-                dst_buf.contents() as *const u8,
+                src_buf.contents() as *const u8,
                 total_bytes as usize,
             );
         }
@@ -1479,6 +1613,45 @@ impl MetalBabyBearDft {
         );
     }
 
+    /// Dispatch the Stockham radix-4 gather-scatter kernel.
+    /// Handles up to 4096-point sub-DFTs (4 elements per thread, 1024 threads).
+    fn dispatch_stockham_gs(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        input: &metal::BufferRef,
+        output: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        log_block: u32,
+        load_stride: u32,
+        store_stride: u32,
+        apply_twiddle: u32,
+    ) {
+        let block_size = 1u32 << log_block;
+        let threads = block_size >> 2; // radix-4: 4 elements per thread
+        let num_blocks = height / block_size;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        enc.set_compute_pipeline_state(&self.stockham_gs_ps);
+        enc.set_buffer(0, Some(input), 0);
+        enc.set_buffer(1, Some(output), 0);
+        enc.set_buffer(2, Some(twiddles), 0);
+        set_u32(enc, 3, height);
+        set_u32(enc, 4, width);
+        set_u32(enc, 5, log_block);
+        set_u32(enc, 6, load_stride);
+        set_u32(enc, 7, store_stride);
+        set_u32(enc, 8, apply_twiddle);
+
+        enc.dispatch_thread_groups(
+            MTLSize { width: num_blocks as u64, height: 1, depth: 1 },
+            MTLSize { width: threads as u64, height: 1, depth: 1 },
+        );
+    }
+
     /// Pure Stockham NTT: shared-mem Stockham for first 12 stages, then
     /// Stockham global R2 for remaining stages with ping-pong buffers.
     /// No bit-reversal needed. All memory accesses are coalesced.
@@ -1553,15 +1726,50 @@ impl MetalBabyBearDft {
         height: u32,
         width: u32,
     ) {
+        self.encode_four_step_ntt_buffers(enc, data_buf, data_buf, temp_buf, twiddles,
+            log_n, height, width);
+    }
+
+    /// Four-step FFT out-of-place: reads from `src`, writes natural-order
+    /// result to `dst`, using `temp` as scratch.
+    fn encode_four_step_ntt_oop(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &metal::BufferRef,
+        dst: &metal::BufferRef,
+        temp: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        self.encode_four_step_ntt_buffers(enc, src, dst, temp, twiddles,
+            log_n, height, width);
+    }
+
+    /// Core four-step implementation: reads from `src`, writes to `dst`.
+    /// Uses Stockham radix-4 gather-scatter kernel for sub-DFTs up to 4096
+    /// points (log_block ≤ 12), covering NTTs up to 2^24.
+    fn encode_four_step_ntt_buffers(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &metal::BufferRef,
+        dst: &metal::BufferRef,
+        temp: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
         let log_n1 = log_n / 2;
         let log_n2 = log_n - log_n1;
         let n1 = 1u32 << log_n1;
         let n2 = 1u32 << log_n2;
 
         // Step 1: N2 groups of N1-point column DFTs.
-        // Gather from data_buf (stride N2), contiguous store to temp_buf.
-        self.dispatch_shared_mem_gs(
-            enc, data_buf, temp_buf, twiddles,
+        // Gather from src (stride N2), contiguous store to temp.
+        self.dispatch_stockham_gs(
+            enc, src, temp, twiddles,
             height, width, log_n1,
             n2, // load_stride = N2 (gather columns)
             1,  // store_stride = 1 (contiguous blocks)
@@ -1569,13 +1777,13 @@ impl MetalBabyBearDft {
         );
 
         // Step 2: N1 groups of N2-point row DFTs with fused twiddle.
-        // Gather from temp_buf (stride N1) with twiddle ω_N^{k1·n2},
-        // scatter-store to data_buf (stride N1) → natural output order.
+        // Gather from temp (stride N1) with twiddle ω_N^{k1·n2},
+        // scatter-store to dst (stride N1) → natural output order.
         {
-            let res: &metal::ResourceRef = temp_buf.deref();
+            let res: &metal::ResourceRef = temp.deref();
             enc.memory_barrier_with_resources(&[res]);
-            self.dispatch_shared_mem_gs(
-                enc, temp_buf, data_buf, twiddles,
+            self.dispatch_stockham_gs(
+                enc, temp, dst, twiddles,
                 height, width, log_n2,
                 n1, // load_stride = N1 (gather rows from column-DFT output)
                 n1, // store_stride = N1 (scatter → natural order)
@@ -1601,21 +1809,21 @@ impl MetalBabyBearDft {
             enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
         };
 
+        let shared_log_block = log_n.min(self.max_log_shared_block);
+
+        if shared_log_block == log_n {
+            self.dispatch_dif_shared_bitrev(
+                enc, data, dst, twiddles, height, width, 0, log_n, log_n,
+            );
+            return;
+        }
+
+        let global_stages = log_n - shared_log_block;
         let tg_w = width.min(32);
         let mut dif_stage = 0u32;
-        let total_stages = log_n;
 
-        let final_stages = match total_stages % 4 {
-            0 => 4,
-            1 => 1,
-            2 => 2,
-            3 => 3,
-            _ => unreachable!(),
-        };
-        let final_dif_stage = total_stages - final_stages;
-
-        while dif_stage < final_dif_stage {
-            let gap = final_dif_stage - dif_stage;
+        while dif_stage < global_stages {
+            let gap = global_stages - dif_stage;
             if gap >= 4 {
                 let num_units = height >> 4;
                 let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
@@ -1635,148 +1843,22 @@ impl MetalBabyBearDft {
                 );
                 dif_stage += 4;
             } else if gap >= 3 {
-                let num_units = height >> 3;
-                let max_tg = self.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r8_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r8_ps, 3);
                 dif_stage += 3;
             } else if gap == 2 {
-                let num_units = height >> 2;
-                let max_tg = self.dif_r4_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r4_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r4_ps, 2);
                 dif_stage += 2;
             } else {
-                let num_butterflies = height >> 1;
-                let max_tg = self.dif_r2_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r2_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_butterflies) as u64,
-                        depth: 1,
-                    },
-                );
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r2_ps, 1);
                 dif_stage += 1;
             }
         }
 
-        debug_assert_eq!(dif_stage, final_dif_stage);
-
-        // Final fused-bitrev dispatch (out-of-place: data → dst).
-        match final_stages {
-            4 => {
-                let num_units = height >> 4;
-                let max_tg = self.dif_r16_bitrev_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r16_bitrev_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(twiddles), 0);
-                set_u32(enc, 3, height);
-                set_u32(enc, 4, width);
-                set_u32(enc, 5, dif_stage);
-                set_u32(enc, 6, log_n);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
-            }
-            3 => {
-                let num_units = height >> 3;
-                let max_tg = self.dif_r8_bitrev_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r8_bitrev_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(twiddles), 0);
-                set_u32(enc, 3, height);
-                set_u32(enc, 4, width);
-                set_u32(enc, 5, dif_stage);
-                set_u32(enc, 6, log_n);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
-            }
-            2 => {
-                let num_units = height >> 2;
-                let max_tg = self.dif_r4_bitrev_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r4_bitrev_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(twiddles), 0);
-                set_u32(enc, 3, height);
-                set_u32(enc, 4, width);
-                set_u32(enc, 5, dif_stage);
-                set_u32(enc, 6, log_n);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
-            }
-            1 => {
-                let num_butterflies = height >> 1;
-                let max_tg = self.dif_r2_bitrev_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r2_bitrev_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(twiddles), 0);
-                set_u32(enc, 3, height);
-                set_u32(enc, 4, width);
-                set_u32(enc, 5, dif_stage);
-                set_u32(enc, 6, log_n);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_butterflies) as u64,
-                        depth: 1,
-                    },
-                );
-            }
-            _ => unreachable!(),
-        }
+        // Tail: shared-memory DIF + bitrev (out-of-place: data → dst)
+        self.dispatch_dif_shared_bitrev(
+            enc, data, dst, twiddles, height, width,
+            dif_stage, log_n, shared_log_block,
+        );
     }
 
     /// DIF NTT with zero-copy roundtrip: first R16 dispatch reads from
@@ -1794,130 +1876,23 @@ impl MetalBabyBearDft {
         height: u32,
         width: u32,
     ) {
-        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
-            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
-        };
-        let tg_w = width.min(32);
+        let shared_lb = log_n.min(self.max_log_shared_block);
+        let global_stages = log_n - shared_lb;
 
-        let mut dif_stage = 0u32;
-        let mut first_dispatch = true;
-
-        // All DIF stages: first out-of-place (zc→managed), rest in-place on managed.
-        while dif_stage < log_n {
-            let gap = log_n - dif_stage;
-            if gap >= 4 {
-                let num_units = height >> 4;
-                if first_dispatch {
-                    let max_tg = self.dif_r16_oop_ps.max_total_threads_per_threadgroup() as u32;
-                    enc.set_compute_pipeline_state(&self.dif_r16_oop_ps);
-                    enc.set_buffer(0, Some(zc_buf), 0);
-                    enc.set_buffer(1, Some(data), 0);
-                    enc.set_buffer(2, Some(twiddles), 0);
-                    set_u32(enc, 3, height);
-                    set_u32(enc, 4, width);
-                    set_u32(enc, 5, dif_stage);
-                    enc.dispatch_threads(
-                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                        MTLSize {
-                            width: tg_w as u64,
-                            height: (max_tg / tg_w).min(num_units) as u64,
-                            depth: 1,
-                        },
-                    );
-                    first_dispatch = false;
-                } else {
-                    let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
-                    enc.set_compute_pipeline_state(&self.dif_r16_ps);
-                    enc.set_buffer(0, Some(data), 0);
-                    enc.set_buffer(1, Some(twiddles), 0);
-                    set_u32(enc, 2, height);
-                    set_u32(enc, 3, width);
-                    set_u32(enc, 4, dif_stage);
-                    enc.dispatch_threads(
-                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                        MTLSize {
-                            width: tg_w as u64,
-                            height: (max_tg / tg_w).min(num_units) as u64,
-                            depth: 1,
-                        },
-                    );
-                }
-                dif_stage += 4;
-            } else if gap >= 3 {
-                let num_units = height >> 3;
-                let max_tg = self.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r8_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
-                dif_stage += 3;
-            } else if gap == 2 {
-                let num_units = height >> 2;
-                let max_tg = self.dif_r4_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r4_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
-                dif_stage += 2;
-            } else {
-                let num_butterflies = height >> 1;
-                let max_tg = self.dif_r2_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r2_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_butterflies) as u64,
-                        depth: 1,
-                    },
-                );
-                dif_stage += 1;
-            }
-        }
-
-        // Bitrev gather: data[bitrev(row)] → zc_buf[row] (coalesced writes
-        // to zero-copy memory; random reads from GPU-cached managed data).
-        enc.set_compute_pipeline_state(&self.bitrev_gather_ps);
-        enc.set_buffer(0, Some(data), 0);
-        enc.set_buffer(1, Some(zc_buf), 0);
-        set_u32(enc, 2, height);
-        set_u32(enc, 3, width);
-        set_u32(enc, 4, log_n);
-        {
-            let max_tg = self.bitrev_gather_ps.max_total_threads_per_threadgroup() as u32;
-            enc.dispatch_threads(
-                MTLSize { width: width as u64, height: height as u64, depth: 1 },
-                MTLSize {
-                    width: tg_w as u64,
-                    height: (max_tg / tg_w).min(height) as u64,
-                    depth: 1,
-                },
+        if global_stages > 0 {
+            // Partial DIF stages: zc→managed (first OOP), then in-place.
+            self.encode_dif_stages_inplace(enc, zc_buf, data, twiddles,
+                global_stages, height, width);
+            // Shared-memory tail + bitrev: data → zc_buf (natural order).
+            self.dispatch_dif_shared_bitrev(
+                enc, data, zc_buf, twiddles,
+                height, width, global_stages, log_n, shared_lb,
             );
+        } else {
+            // Entire NTT fits in shared memory. Copy zc→data first.
+            self.encode_dif_stages_inplace(enc, zc_buf, data, twiddles,
+                log_n, height, width);
+            self.encode_bitrev_gather(enc, data, zc_buf, height, width, log_n);
         }
     }
 

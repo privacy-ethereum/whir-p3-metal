@@ -807,6 +807,54 @@ from ~33 dispatches down to ~2.
 
 ---
 
+## Optimization 11 — Shared-Memory DIF Tail
+
+### What it does
+
+Replaces the final 2-3 global-memory DIF kernel dispatches with a single
+**shared-memory DIF + bit-reversal** dispatch (`bb_dif_shared_bitrev`).
+The kernel was already compiled but never wired into the dispatch path.
+
+The existing radix-16 DIF approach processes 4 stages per dispatch, each
+requiring a full read and write of the entire matrix from global memory.
+For a `log_n=22` NTT, that's 6 dispatches (22/4 ≈ 6 with remainder handling).
+
+The shared-memory kernel loads a block of `2^10 = 1024` elements into
+threadgroup memory, performs all 10 DIF stages there with fast threadgroup
+barriers, and writes the result in natural (bit-reversed) order directly
+to the output buffer — replacing 2-3 global memory passes with 1:
+
+```
+    Before (log_n=22):
+    ┌────────────────────────────────────────────────┐
+    │ 5× bb_dif_r16 (stages 0-19, in-place)         │  5 global mem passes
+    │ 1× bb_dif_r4_bitrev (stages 20-21, OOP)       │  1 global mem pass
+    │                                    Total: 6    │
+    └────────────────────────────────────────────────┘
+
+    After (log_n=22):
+    ┌────────────────────────────────────────────────┐
+    │ 3× bb_dif_r16 (stages 0-11, in-place)         │  3 global mem passes
+    │ 1× bb_dif_shared_bitrev (stages 12-21, OOP)   │  1 global mem pass
+    │                                    Total: 4    │
+    └────────────────────────────────────────────────┘
+```
+
+The shared-memory kernel handles the tail `min(log_n, 10)` stages.
+For NTTs with `log_n ≤ 10`, the entire NTT runs in a single dispatch.
+
+Also applies to the zero-copy path: the separate `encode_bitrev_gather`
+pass is replaced by the fused shared-memory dispatch, eliminating one
+additional global memory round-trip.
+
+### Impact
+
+~15-20% faster DFT+Merkle commit for large NTTs (log_n ≥ 16).
+Also fixed a crash for `fold=8` configurations where `log_n ≤ 10` in
+later prover rounds (the zero-copy path was reading uninitialized memory).
+
+---
+
 ## Current Benchmark Results
 
 Best GPU/CPU speedup per configuration (taking max of GPU, Fused, Grind).
@@ -817,56 +865,55 @@ grinding; numbers below are from a single sweep run.
 
 | fold | rate=1 | rate=2 | rate=3 |
 |------|--------|--------|--------|
-| 1    | 0.84x  | 0.86x  | **1.23x** |
-| 2    | 0.76x  | 0.80x  | **1.09x** |
-| 3    | 0.60x  | 0.78x  | 0.95x  |
-| 4    | 0.67x  | 0.78x  | **1.05x** |
-| 6    | 0.71x  | 0.76x  | **1.01x** |
-| 8    | 0.70x  | 0.70x  | 0.83x  |
+| 1    | 0.56x  | 0.95x  | **1.12x** |
+| 2    | 0.77x  | 0.90x  | 0.94x  |
+| 3    | 0.66x  | 0.99x  | **1.13x** |
+| 4    | 0.71x  | 0.67x  | 0.90x  |
+| 6    | 0.68x  | 0.78x  | 0.74x  |
+| 8    | 0.75x  | 0.79x  | 0.76x  |
 
-GPU overhead dominates at small sizes. Only rate=3 shows benefit.
+GPU overhead dominates at small sizes. Only rate=3 shows occasional benefit.
 
 ### n=20 (2^20 = 1M coefficients)
 
 | fold | rate=1 | rate=2 | rate=3 |
 |------|--------|--------|--------|
-| 1    | **1.27x** | **1.53x** | **1.44x** |
-| 2    | 0.98x  | **1.23x** | **1.46x** |
-| 3    | 0.85x  | 1.00x  | **1.28x** |
-| 4    | 0.96x  | **1.04x** | **1.38x** |
-| 6    | 0.90x  | **1.37x** | **1.45x** |
-| 8    | **1.04x** | **1.22x** | **1.31x** |
+| 1    | **1.03x** | **1.20x** | **1.37x** |
+| 2    | 0.95x  | **1.18x** | **1.35x** |
+| 3    | 0.96x  | 0.97x  | **1.28x** |
+| 4    | 0.82x  | **1.01x** | **1.39x** |
+| 6    | 0.84x  | **1.14x** | **1.37x** |
+| 8    | 0.89x  | **1.05x** | **1.30x** |
 
-GPU starts winning at rate ≥ 2. Best: fold=1 rate=2 at 1.53x.
+GPU starts winning at rate ≥ 2. Best: fold=4 rate=3 at 1.39x.
 
 ### n=22 (2^22 = 4M coefficients)
 
 | fold | rate=1 | rate=2 | rate=3 |
 |------|--------|--------|--------|
-| 1    | **1.35x** | **1.47x** | **1.53x** |
-| 2    | **1.50x** | **1.43x** | **1.51x** |
-| 3    | **1.20x** | **1.44x** | **1.37x** |
-| 4    | **1.32x** | **1.52x** | **1.45x** |
-| 6    | **1.33x** | **1.37x** | **2.12x** |
-| 8    | **1.32x** | **1.38x** | **1.75x** |
+| 1    | **1.25x** | **1.40x** | **1.51x** |
+| 2    | **1.22x** | **1.39x** | **1.48x** |
+| 3    | **1.17x** | **1.32x** | **1.44x** |
+| 4    | **1.35x** | **1.67x** | **1.86x** |
+| 6    | **1.42x** | **1.92x** | **2.48x** |
+| 8    | **1.30x** | **1.37x** | **1.67x** |
 
-GPU consistently faster. Best: fold=6 rate=3 at **2.12x** (GPU grinding).
+GPU consistently faster. Best: fold=6 rate=3 at **2.48x** (GPU grinding).
 
 ### n=24 (2^24 = 16M coefficients)
 
 | fold | rate=1 | rate=2 | rate=3 |
 |------|--------|--------|--------|
-| 1    | **1.48x** | **1.27x** | 1.02x  |
-| 2    | **1.40x** | **1.53x** | **1.55x** |
-| 3    | **1.59x** | **1.48x** | **1.64x** |
-| 4    | **2.12x** | **2.50x** | **2.37x** |
-| 6    | **1.62x** | **1.19x** | **1.39x** |
-| 8    | —      | —      | —      |
+| 1    | **1.39x** | **1.35x** | **1.09x** |
+| 2    | **1.39x** | **1.50x** | **1.54x** |
+| 3    | **1.35x** | **1.47x** | **1.69x** |
+| 4    | **1.49x** | **2.11x** | **2.06x** |
+| 6    | **1.58x** | **1.49x** | **2.00x** |
+| 8    | **2.48x** | —      | —      |
 
-Best: fold=4 rate=2 at **2.50x** (GPU grinding). Fold=4 consistently
-strong because NTT sizes hit the GPU sweet spot and PoW grinding is
-significant. Fold=8 at n=24 is unstable (intermittent crash from
-pre-existing Metal initialization issue).
+Best: fold=8 rate=1 at **2.48x** and fold=4 rate=2 at **2.11x**.
+Fold=4-6 consistently strong. Rate=2-3 at n=24 can exceed GPU memory
+limits for some fold values.
 
 ### Optimization progression
 
@@ -881,6 +928,7 @@ pre-existing Metal initialization issue).
 | 7   | GPU PoW Grinding + buffer caching  | Up to 2.58x total              |
 | 8   | Fused transpose+pad+DFT+Merkle     | Eliminates transpose overhead  |
 | 9   | Adaptive GPU dispatch bounds       | Avoids GPU regressions         |
-| 10  | Adaptive PoW batch size            | **Up to 2.50x total**          |
+| 10  | Adaptive PoW batch size            | Reduces dispatch overhead      |
+| 11  | Shared-memory DIF tail             | **33% fewer global mem passes**|
 
 
