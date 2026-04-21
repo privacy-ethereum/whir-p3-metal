@@ -637,7 +637,7 @@ impl MetalBabyBearDft {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val < 64 * 1024 * 1024 {
+        if total_bytes_val < 8 * 1024 * 1024 {
             return None;
         }
 
@@ -646,24 +646,47 @@ impl MetalBabyBearDft {
 
         // Managed buffer for DIF stages (fast GPU memory).
         let dif_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
-        // Managed buffer for bitrev'd output (natural order, stays on GPU for Merkle).
-        let natural_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
 
-        // Try zero-copy input: wrap values directly as Metal buffer.
+        // Try zero-copy: wrap values as a Metal buffer so the bitrev gather
+        // writes the result directly into `values` (no post-GPU memcpy).
         let zc_input = self.try_zero_copy_buffer(values, total_bytes);
+
+        // If zero-copy works, bitrev writes back to the zc buffer and
+        // Merkle hashing reads from it — eliminating the separate
+        // natural_buf allocation and the full matrix readback.
+        let need_natural_buf = zc_input.is_none();
+        let natural_buf = if need_natural_buf {
+            Some(Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes))
+        } else {
+            None
+        };
 
         let result = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
 
             if let Some(ref zc_buf) = zc_input {
-                // First R16 OOP: zc_buf → dif_buf
-                // Remaining DIF stages: in-place on dif_buf
-                // All dispatches without the final bitrev (we handle it ourselves)
+                // Zero-copy path: DIF stages read from zc, work on managed
                 self.encode_dif_stages_inplace(&enc, zc_buf, &dif_buf, &tw,
                     log_n, height as u32, width as u32);
+                // Bitrev gather writes directly back into values (zc_buf)
+                self.encode_bitrev_gather(&enc, &dif_buf, zc_buf,
+                    height as u32, width as u32, log_n);
+                // Merkle hashing reads from zc_buf (= values in natural order)
+                let merkle_layers = self.encode_merkle_tree(
+                    &enc, zc_buf, height as u32, width as u32,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                if cmd.status() == MTLCommandBufferStatus::Error {
+                    return None;
+                }
+                // No memcpy needed — values already contains the DFT result
+                Some(Self::read_merkle_layers(&merkle_layers))
             } else {
-                // CPU memcpy into managed buffer, DIF in-place
+                let nat = natural_buf.as_ref().unwrap();
+                // Fallback: CPU memcpy in, DIF in-place, bitrev to natural_buf
                 unsafe {
                     fast_memcpy(
                         dif_buf.contents() as *mut u8,
@@ -673,39 +696,32 @@ impl MetalBabyBearDft {
                 }
                 self.encode_dif_stages_only(&enc, &dif_buf, &tw,
                     log_n, height as u32, width as u32);
-            }
-
-            // Bitrev gather: dif_buf → natural_buf (managed→managed, fast)
-            self.encode_bitrev_gather(&enc, &dif_buf, &natural_buf,
-                height as u32, width as u32, log_n);
-
-            // Merkle tree: hash natural_buf rows, compress all layers
-            let merkle_layers = self.encode_merkle_tree(
-                &enc, &natural_buf, height as u32, width as u32,
-            );
-
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            if cmd.status() == MTLCommandBufferStatus::Error {
-                return None;
-            }
-
-            // Copy DFT result back to CPU (read from natural_buf)
-            unsafe {
-                fast_memcpy_from_gpu(
-                    values.as_mut_ptr().cast::<u8>(),
-                    natural_buf.contents() as *const u8,
-                    total_bytes as usize,
+                self.encode_bitrev_gather(&enc, &dif_buf, nat,
+                    height as u32, width as u32, log_n);
+                let merkle_layers = self.encode_merkle_tree(
+                    &enc, nat, height as u32, width as u32,
                 );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                if cmd.status() == MTLCommandBufferStatus::Error {
+                    return None;
+                }
+                unsafe {
+                    fast_memcpy_from_gpu(
+                        values.as_mut_ptr().cast::<u8>(),
+                        nat.contents() as *const u8,
+                        total_bytes as usize,
+                    );
+                }
+                Some(Self::read_merkle_layers(&merkle_layers))
             }
-
-            Some(Self::read_merkle_layers(&merkle_layers))
         });
 
         Self::release_buf(&self.data_buf_cache, dif_buf);
-        Self::release_buf(&self.temp_buf_cache, natural_buf);
+        if let Some(buf) = natural_buf {
+            Self::release_buf(&self.temp_buf_cache, buf);
+        }
         result
     }
 
@@ -986,7 +1002,7 @@ impl MetalBabyBearDft {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val < 64 * 1024 * 1024 {
+        if total_bytes_val < 8 * 1024 * 1024 {
             return None;
         }
 
@@ -2024,7 +2040,7 @@ where
             let height = inputs[0].height();
             let width = inputs[0].width();
             let total_bytes = height * width * size_of::<u32>();
-            if total_bytes >= 32 * 1024 * 1024 {
+            if total_bytes >= 8 * 1024 * 1024 {
                 let is_contiguous = height >= 2 && {
                     let s0 = inputs[0].row_slice(0).unwrap();
                     let s1 = inputs[0].row_slice(1).unwrap();
