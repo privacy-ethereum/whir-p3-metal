@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use metal::{
@@ -604,6 +605,84 @@ impl MetalBabyBearDft {
             let found_val = unsafe { *(bufs.found_buf.contents() as *const u32) };
             if found_val != 0 {
                 let winner = unsafe { *(bufs.result_buf.contents() as *const u32) };
+                return Some(winner);
+            }
+
+            nonce_offset += this_batch;
+        }
+
+        None
+    }
+
+    /// Like `gpu_pow_grind`, but checks a shared `AtomicBool` between batch
+    /// dispatches. Returns `None` early if the flag is set by a concurrent CPU
+    /// search thread. Signals the flag itself when it finds a witness.
+    pub fn gpu_pow_grind_cancellable(
+        &self,
+        base_state_monty: &[u32; 16],
+        witness_idx: u32,
+        pow_bits: u32,
+        cancelled: &AtomicBool,
+    ) -> Option<u32> {
+        const P: u64 = 0x7800_0001;
+
+        let bufs = self.pow_bufs.lock().expect("pow_bufs mutex");
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base_state_monty.as_ptr(),
+                bufs.state_buf.contents() as *mut u32,
+                16,
+            );
+            *(bufs.params_buf.contents() as *mut [u32; 4]) =
+                [witness_idx, pow_bits, bufs.r_squared, 0];
+            *(bufs.result_buf.contents() as *mut u32) = 0;
+            *(bufs.found_buf.contents() as *mut u32) = 0;
+        }
+
+        let batch_size: u64 = if pow_bits >= 24 {
+            1 << 24
+        } else if pow_bits >= 20 {
+            1 << 22
+        } else {
+            1 << 20
+        };
+        let tg_size = bufs.tg_size;
+
+        let mut nonce_offset: u64 = 0;
+        while nonce_offset < P {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+
+            let this_batch = (P - nonce_offset).min(batch_size);
+
+            unsafe { *(bufs.offset_buf.contents() as *mut u32) = nonce_offset as u32; }
+
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.poseidon2_pow_grind_ps);
+            enc.set_buffer(0, Some(&bufs.state_buf), 0);
+            enc.set_buffer(1, Some(&self.poseidon2_rc_buf), 0);
+            enc.set_buffer(2, Some(&bufs.params_buf), 0);
+            enc.set_buffer(3, Some(&bufs.params_buf), 4);
+            enc.set_buffer(4, Some(&bufs.params_buf), 8);
+            enc.set_buffer(5, Some(&bufs.result_buf), 0);
+            enc.set_buffer(6, Some(&bufs.found_buf), 0);
+            enc.set_buffer(7, Some(&bufs.offset_buf), 0);
+
+            enc.dispatch_threads(
+                metal::MTLSize::new(this_batch, 1, 1),
+                metal::MTLSize::new(tg_size, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let found_val = unsafe { *(bufs.found_buf.contents() as *const u32) };
+            if found_val != 0 {
+                let winner = unsafe { *(bufs.result_buf.contents() as *const u32) };
+                cancelled.store(true, Ordering::Relaxed);
                 return Some(winner);
             }
 
@@ -2648,16 +2727,74 @@ use p3_baby_bear::Poseidon2BabyBear;
 use p3_challenger::{
     CanObserve, CanSample, CanSampleBits, DuplexChallenger, FieldChallenger, GrindingChallenger,
 };
-use p3_field::{ExtensionField, PrimeField64};
-use p3_symmetric::{CryptographicPermutation, Hash, MerkleCap};
+use p3_field::PrimeField64;
+use p3_symmetric::{Hash, MerkleCap, Permutation};
 
 type InnerChallenger = DuplexChallenger<BabyBear, Poseidon2BabyBear<16>, 16, 8>;
+
+/// Rayon+SIMD CPU PoW grind with cancellation support.
+///
+/// Reimplements `DuplexChallenger::grind` logic with an `AtomicBool` that is
+/// checked before each batch to allow early termination when the GPU thread
+/// finds a witness first.
+fn cpu_pow_grind_cancellable(
+    perm: &Poseidon2BabyBear<16>,
+    sponge_state: &[BabyBear; 16],
+    input_buffer: &[BabyBear],
+    bits: usize,
+    cancelled: &AtomicBool,
+) -> Option<BabyBear> {
+    type F = BabyBear;
+    type PackedF = <F as Field>::Packing;
+    const WIDTH: usize = 16;
+    const RATE: usize = 8;
+
+    let lanes = PackedF::WIDTH;
+    let num_batches = F::ORDER_U64.div_ceil(lanes as u64);
+    let order = F::ORDER_U64;
+    let mask = (1u64 << bits) - 1;
+    let witness_idx = input_buffer.len();
+
+    let base_packed_state: [PackedF; WIDTH] = core::array::from_fn(|i| {
+        if i < input_buffer.len() {
+            PackedF::from(input_buffer[i])
+        } else {
+            PackedF::from(sponge_state[i])
+        }
+    });
+
+    (0..num_batches)
+        .into_par_iter()
+        .find_map_any(|batch| {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let base = batch * lanes as u64;
+            let mut packed_state = base_packed_state;
+            let packed_witnesses = PackedF::from_fn(|lane| {
+                let candidate = base + lane as u64;
+                if candidate < order {
+                    BabyBear::new(candidate as u32)
+                } else {
+                    BabyBear::NEG_ONE
+                }
+            });
+            packed_state[witness_idx] = packed_witnesses;
+            perm.permute_mut(&mut packed_state);
+            packed_state[RATE - 1]
+                .as_slice()
+                .iter()
+                .zip(packed_witnesses.as_slice())
+                .find(|(sample, _)| (sample.as_canonical_u64() & mask) == 0)
+                .map(|(_, &witness)| witness)
+        })
+}
 
 /// A `DuplexChallenger` wrapper that offloads proof-of-work grinding to GPU.
 ///
 /// All other challenger operations (observe, sample, etc.) delegate to the
-/// inner `DuplexChallenger`. The `grind` call uses a Metal compute kernel
-/// that parallelizes the Poseidon2 brute-force search across GPU threads.
+/// inner `DuplexChallenger`. The `grind` call runs CPU (rayon+SIMD) and GPU
+/// concurrently, returning whichever finds a witness first.
 #[derive(Clone)]
 pub struct GpuChallenger {
     pub inner: InnerChallenger,
@@ -2738,8 +2875,15 @@ impl GrindingChallenger for GpuChallenger {
             return BabyBear::ZERO;
         }
 
-        // Build the pre-permutation state from sponge_state + input_buffer,
-        // matching the CPU DuplexChallenger::grind logic.
+        // For low difficulty, CPU rayon+SIMD is faster than GPU dispatch overhead.
+        // GPU Metal dispatch costs ~100μs; CPU solves 2^bits trials in ~2^bits/40*100ns.
+        // Breakeven around bits=20, so below that we skip the GPU entirely.
+        // With DEFAULT_MAX_POW=16, this means CPU-only grind for standard configs.
+        if bits < 20 {
+            return self.inner.grind(bits);
+        }
+
+        // Build the GPU grind state (Montgomery-form u32 array).
         let witness_idx = self.inner.input_buffer.len();
         let mut base_state_monty = [0u32; 16];
         for i in 0..16 {
@@ -2748,28 +2892,54 @@ impl GrindingChallenger for GpuChallenger {
             } else {
                 self.inner.sponge_state[i]
             };
-            // BabyBear is #[repr(transparent)] over u32 in Montgomery form
             base_state_monty[i] = unsafe { std::mem::transmute::<BabyBear, u32>(val) };
         }
 
-        // Try GPU
-        if let Some(canonical_nonce) = self.dft.gpu_pow_grind(
-            &base_state_monty,
-            witness_idx as u32,
-            bits as u32,
-        ) {
-            // Convert canonical nonce back to BabyBear
-            let witness = BabyBear::new(canonical_nonce);
-            // Verify and update the challenger state (observe + sample)
-            assert!(
-                self.inner.check_witness(bits, witness),
-                "GPU PoW witness failed verification"
-            );
-            return witness;
-        }
+        // Run CPU (rayon+SIMD) and GPU Metal concurrently.
+        // GPU grind stays on the main thread (Metal objects aren't Send).
+        // CPU grind runs on a spawned thread using rayon's thread pool.
+        let cancelled = AtomicBool::new(false);
+        let perm = &self.inner.permutation;
+        let sponge_state = &self.inner.sponge_state;
+        let input_buffer: &[BabyBear] = &self.inner.input_buffer;
+        let dft = &self.dft;
 
-        // GPU didn't find (extremely unlikely) — fall back to CPU
-        self.inner.grind(bits)
+        let witness = std::thread::scope(|s| {
+            let cpu_handle = s.spawn(|| {
+                cpu_pow_grind_cancellable(
+                    perm,
+                    sponge_state,
+                    input_buffer,
+                    bits,
+                    &cancelled,
+                )
+            });
+
+            // GPU grind on main thread (has Metal device access)
+            let gpu_result = dft.gpu_pow_grind_cancellable(
+                &base_state_monty,
+                witness_idx as u32,
+                bits as u32,
+                &cancelled,
+            );
+
+            if let Some(gpu_nonce) = gpu_result {
+                // GPU found it — signal CPU and return
+                cancelled.store(true, Ordering::Relaxed);
+                let _ = cpu_handle.join();
+                BabyBear::new(gpu_nonce)
+            } else {
+                // GPU was cancelled or exhausted — CPU must have found it
+                let cpu_result = cpu_handle.join().unwrap();
+                cpu_result.expect("Neither CPU nor GPU found PoW witness")
+            }
+        });
+
+        assert!(
+            self.inner.check_witness(bits, witness),
+            "concurrent PoW witness failed verification"
+        );
+        witness
     }
 }
 

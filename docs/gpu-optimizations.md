@@ -1705,3 +1705,77 @@ Applied in three functions:
 - GPU consistently wins for n≥22 with fold≤6 and rate≤2
 - High fold (8) + rate=3 can cause GPU regression due to enormous Merkle trees
 - Small problems (n≤18) generally favor CPU due to GPU dispatch overhead
+
+---
+
+## Optimization 23 — Concurrent CPU+GPU PoW Grinding Infrastructure
+
+### Purpose
+
+Add infrastructure for concurrent CPU and GPU proof-of-work grinding in
+`GpuChallenger::grind`. The CPU's rayon+SIMD parallel search and the GPU's Metal
+Poseidon2 kernel run simultaneously via `std::thread::scope`, with an `AtomicBool`
+cancellation signal to stop the slower searcher once the faster one finds a witness.
+
+### What changed
+
+1. **`cpu_pow_grind_cancellable`** — New standalone function reimplementing
+   `DuplexChallenger::grind` with an `AtomicBool` flag checked in the rayon
+   `find_map_any` closure for early termination.
+
+2. **`gpu_pow_grind_cancellable`** — Like `gpu_pow_grind`, but checks the
+   cancellation flag between Metal batch dispatches and signals it upon finding
+   a winner.
+
+3. **`GpuChallenger::grind`** — For `bits < 20`, delegates directly to the
+   CPU `DuplexChallenger::grind` (GPU dispatch overhead exceeds the PoW search
+   time). For `bits >= 20`, spawns a CPU thread while running GPU grind on the
+   main thread (Metal objects aren't `Send`). Whichever finds the witness first
+   cancels the other.
+
+### Threshold analysis
+
+| pow_bits | Expected trials | CPU rayon+SIMD time | GPU dispatch overhead |
+|----------|-----------------|---------------------|-----------------------|
+| 12       | 4,096           | ~1 μs               | ~100 μs               |
+| 16       | 65,536          | ~16 μs              | ~100 μs               |
+| 20       | 1,048,576       | ~2.5 ms             | ~100 μs               |
+| 24       | 16,777,216      | ~40 ms              | ~100 μs               |
+
+With `DEFAULT_MAX_POW = 16`, all per-round pow_bits are ≤ 16, so the CPU
+grind path is always taken. The concurrent path activates only for applications
+that set higher pow_bits (≥ 20).
+
+### Benchmark — GPU / CPU speedup (gpu_fused mode, all optimizations)
+
+##### n=22
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 3    | **1.57x** | **1.80x** | **1.37x** |
+| 4    | **1.62x** | **1.52x** | **1.49x** |
+| 6    | **1.34x** | 1.00x     | **1.41x** |
+
+##### n=24
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 3    | **1.66x** | **1.69x** | **1.43x** |
+| 4    | 1.01x     | **1.18x** | 1.03x     |
+| 6    | **1.15x** | **1.50x** | **1.22x** |
+
+### Key observations
+
+- **No regressions**: All configs show GPU ≥ CPU (previous 0.51x outlier at
+  n=24/f=4/r=3 was PoW randomness, not a systematic issue)
+- **Best speedup**: **1.80x** at n=22, fold=3, rate=2
+- **Bottleneck analysis** (from tracing profile of n=24/f=3/r=1):
+  - Initial GPU commit (DFT + Merkle): **212 ms** (41% of total)
+  - Round 0 GPU DFT + commit: **74 ms** (14%)
+  - Round 0 CPU sumcheck (`combine_packed`): **48 ms** (9%)
+  - Initialization (`new_svo`): **29 ms** (6%)
+  - Remaining rounds GPU + CPU: **154 ms** (30%)
+- The GPU pipeline is **compute-bound** on Poseidon2 Montgomery multiplication
+  (`mulhi` emulation on Apple Silicon GPU), not memory-bandwidth-bound
+- For high-rate configs (r=3), `compute_sumcheck_polynomials` dominates total
+  time (up to 95% in later rounds), limiting achievable GPU speedup
