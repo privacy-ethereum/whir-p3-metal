@@ -284,6 +284,7 @@ pub struct MetalInner {
     dft_result_cache: Arc<Mutex<Option<(usize, usize, Buffer)>>>,
     poseidon2_hash_leaves_ps: ComputePipelineState,
     poseidon2_hash_and_compress_ps: ComputePipelineState,
+    poseidon2_hash4_compress3_ps: ComputePipelineState,
     poseidon2_compress_ps: ComputePipelineState,
     poseidon2_pow_grind_ps: ComputePipelineState,
     transpose_pad_ps: ComputePipelineState,
@@ -448,6 +449,7 @@ impl MetalBabyBearDft {
         let dif_shared_bitrev_xl_ps = make_ps("bb_dif_shared_bitrev_xl");
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_hash_and_compress_ps = make_ps("poseidon2_hash_and_compress");
+        let poseidon2_hash4_compress3_ps = make_ps("poseidon2_hash4_compress3");
         let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
         let poseidon2_pow_grind_ps = make_ps("poseidon2_pow_grind");
         let transpose_pad_ps = make_ps("bb_transpose_pad");
@@ -525,6 +527,7 @@ impl MetalBabyBearDft {
             dft_result_cache: Arc::new(Mutex::new(None)),
             poseidon2_hash_leaves_ps,
             poseidon2_hash_and_compress_ps,
+            poseidon2_hash4_compress3_ps,
             poseidon2_compress_ps,
             poseidon2_pow_grind_ps,
             transpose_pad_ps,
@@ -934,7 +937,24 @@ impl MetalBabyBearDft {
         let buf = Self::acquire_buf(&self.merkle_buf_cache, &self.device, total_bytes);
 
         let start_layer;
-        if num_leaves >= 2 && layer_counts.len() >= 2 {
+        if num_leaves >= 4 && layer_counts.len() >= 3 {
+            let quads = num_leaves / 4;
+            let max_tg = self.poseidon2_hash4_compress3_ps
+                .max_total_threads_per_threadgroup() as u64;
+            enc.set_compute_pipeline_state(&self.poseidon2_hash4_compress3_ps);
+            enc.set_buffer(0, Some(data_buf), 0);
+            enc.set_buffer(1, Some(&buf), offsets[0]);
+            enc.set_buffer(2, Some(&buf), offsets[1]);
+            enc.set_buffer(3, Some(&buf), offsets[2]);
+            enc.set_buffer(4, Some(&self.poseidon2_rc_buf), 0);
+            set_u32(enc, 5, quads);
+            set_u32(enc, 6, leaf_width);
+            enc.dispatch_threads(
+                MTLSize { width: quads as u64, height: 1, depth: 1 },
+                MTLSize { width: max_tg.min(256), height: 1, depth: 1 },
+            );
+            start_layer = 3;
+        } else if num_leaves >= 2 && layer_counts.len() >= 2 {
             let pairs = num_leaves / 2;
             let max_tg = self.poseidon2_hash_and_compress_ps
                 .max_total_threads_per_threadgroup() as u64;
@@ -968,7 +988,11 @@ impl MetalBabyBearDft {
 
         let max_tg_compress =
             self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
-        let mut current_count = if start_layer == 2 { num_leaves / 2 } else { num_leaves };
+        let mut current_count = match start_layer {
+            3 => num_leaves / 4,
+            2 => num_leaves / 2,
+            _ => num_leaves,
+        };
         for layer_idx in start_layer..layer_counts.len() {
             let pairs = current_count / 2;
             enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
@@ -1245,21 +1269,20 @@ impl MetalBabyBearDft {
 
         let use_four_step = self.use_four_step(log_n);
 
-        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>)> = autoreleasepool(|| {
-            let cmd = self.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
+        let profiling = std::env::var("GPU_PROFILE").is_ok();
 
-            {
+        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>)> = autoreleasepool(|| {
+            let encode_transpose = |enc: &ComputeCommandEncoderRef| {
                 let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
                     enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
                 };
                 enc.set_compute_pipeline_state(&self.transpose_pad_ps);
                 enc.set_buffer(0, Some(&src_buf), 0);
                 enc.set_buffer(1, Some(&dif_buf), 0);
-                set_u32(&enc, 2, in_rows as u32);
-                set_u32(&enc, 3, in_cols as u32);
-                set_u32(&enc, 4, out_height as u32);
-                set_u32(&enc, 5, elem_size as u32);
+                set_u32(enc, 2, in_rows as u32);
+                set_u32(enc, 3, in_cols as u32);
+                set_u32(enc, 4, out_height as u32);
+                set_u32(enc, 5, elem_size as u32);
                 let tg = self.transpose_pad_ps.max_total_threads_per_threadgroup() as u64;
                 let tg_w = (in_rows as u64).min(16);
                 let tg_h = (tg / tg_w).min(64);
@@ -1267,42 +1290,112 @@ impl MetalBabyBearDft {
                     MTLSize::new(in_rows as u64, out_height as u64, 1),
                     MTLSize::new(tg_w, tg_h, 1),
                 );
-            }
-
-            let dft_out_buf = if use_four_step {
-                self.encode_four_step_ntt(&enc, &dif_buf, &natural_buf, &tw,
-                    log_n, out_height as u32, out_width as u32);
-                &dif_buf
-            } else {
-                self.encode_dif_ntt(
-                    &enc, &dif_buf, &natural_buf, &tw,
-                    log_n, out_height as u32, out_width as u32,
-                );
-                &natural_buf
             };
 
-            let merkle = self.encode_merkle_tree(
-                &enc, dft_out_buf, out_height as u32, out_width as u32,
-            );
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-            if cmd.status() == MTLCommandBufferStatus::Error {
-                self.release_merkle_layers(merkle);
-                return None;
-            }
+            if profiling {
+                use std::time::Instant;
 
-            let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
-            unsafe {
-                out_values.set_len(total_out);
-                fast_memcpy_from_gpu(
-                    out_values.as_mut_ptr().cast::<u8>(),
-                    dft_out_buf.contents() as *const u8,
-                    total_bytes as usize,
+                // Phase 1: Transpose + DFT
+                let t0 = Instant::now();
+                let cmd1 = self.queue.new_command_buffer();
+                let enc1 = cmd1.new_compute_command_encoder();
+                encode_transpose(&enc1);
+                let dft_out_is_dif = if use_four_step {
+                    self.encode_four_step_ntt(&enc1, &dif_buf, &natural_buf, &tw,
+                        log_n, out_height as u32, out_width as u32);
+                    true
+                } else {
+                    self.encode_dif_ntt(
+                        &enc1, &dif_buf, &natural_buf, &tw,
+                        log_n, out_height as u32, out_width as u32,
+                    );
+                    false
+                };
+                enc1.end_encoding();
+                cmd1.commit();
+                cmd1.wait_until_completed();
+                let dft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                let dft_out_buf = if dft_out_is_dif { &dif_buf } else { &natural_buf };
+
+                // Phase 2: Merkle tree
+                let t1 = Instant::now();
+                let cmd2 = self.queue.new_command_buffer();
+                let enc2 = cmd2.new_compute_command_encoder();
+                let merkle = self.encode_merkle_tree(
+                    &enc2, dft_out_buf, out_height as u32, out_width as u32,
                 );
-            }
+                enc2.end_encoding();
+                cmd2.commit();
+                cmd2.wait_until_completed();
+                let merkle_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-            Some((merkle, out_values))
+                // Phase 3: Memcpy
+                let t2 = Instant::now();
+                let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
+                unsafe {
+                    out_values.set_len(total_out);
+                    fast_memcpy_from_gpu(
+                        out_values.as_mut_ptr().cast::<u8>(),
+                        dft_out_buf.contents() as *const u8,
+                        total_bytes as usize,
+                    );
+                }
+                let copy_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+                eprintln!(
+                    "[GPU_PROFILE] transpose_dft_merkle: log_n={log_n} width={out_width} \
+                     | DFT {dft_ms:.1}ms | Merkle {merkle_ms:.1}ms | copy {copy_ms:.1}ms \
+                     | total {:.1}ms",
+                    dft_ms + merkle_ms + copy_ms,
+                );
+
+                if cmd1.status() == MTLCommandBufferStatus::Error
+                    || cmd2.status() == MTLCommandBufferStatus::Error
+                {
+                    self.release_merkle_layers(merkle);
+                    return None;
+                }
+                Some((merkle, out_values))
+            } else {
+                let cmd = self.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                encode_transpose(&enc);
+
+                let dft_out_buf = if use_four_step {
+                    self.encode_four_step_ntt(&enc, &dif_buf, &natural_buf, &tw,
+                        log_n, out_height as u32, out_width as u32);
+                    &dif_buf
+                } else {
+                    self.encode_dif_ntt(
+                        &enc, &dif_buf, &natural_buf, &tw,
+                        log_n, out_height as u32, out_width as u32,
+                    );
+                    &natural_buf
+                };
+
+                let merkle = self.encode_merkle_tree(
+                    &enc, dft_out_buf, out_height as u32, out_width as u32,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                if cmd.status() == MTLCommandBufferStatus::Error {
+                    self.release_merkle_layers(merkle);
+                    return None;
+                }
+
+                let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
+                unsafe {
+                    out_values.set_len(total_out);
+                    fast_memcpy_from_gpu(
+                        out_values.as_mut_ptr().cast::<u8>(),
+                        dft_out_buf.contents() as *const u8,
+                        total_bytes as usize,
+                    );
+                }
+                Some((merkle, out_values))
+            }
         });
 
         Self::release_buf(&self.data_buf_cache, dif_buf);

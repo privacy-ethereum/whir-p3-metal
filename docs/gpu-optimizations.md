@@ -1161,12 +1161,12 @@ buffers (one per digest layer). For n=22 this meant 22 individual
 manager. Now:
 
 1. **Single allocation**: all layers are packed into one buffer with
-   256-byte-aligned offsets, reducing 22 allocations to 1.
+  256-byte-aligned offsets, reducing 22 allocations to 1.
 2. **Buffer pooling**: the contiguous buffer is cached and reused across
-   rounds (via `acquire_buf` / `release_buf`), so subsequent Merkle trees
+  rounds (via `acquire_buf` / `release_buf`), so subsequent Merkle trees
    reuse the same allocation.
 3. **Offset-based dispatch**: each compression kernel binds the single
-   buffer at different offsets, eliminating per-layer buffer objects.
+  buffer at different offsets, eliminating per-layer buffer objects.
 
 ### Why it helps
 
@@ -1239,28 +1239,28 @@ compute-heavy configurations. No regressions observed.
 ### Optimization progression
 
 
-| #   | Optimization                       | Key improvement                 |
-| --- | ---------------------------------- | ------------------------------- |
-| 1   | GPU NTT (Metal)                    | Established GPU pipeline        |
-| 2   | Radix-16 DIF + zero-copy           | 4x fewer dispatches, no memcpy  |
-| 3   | GPU Poseidon2 Merkle               | ~10% whir_prove speedup         |
-| 4   | Fused DFT→Merkle                   | ~15-18% additional speedup      |
-| 5   | Fused prover rounds                | Up to 1.63x total               |
-| 6   | Lower threshold + zero-copy bitrev | Up to 1.88x total               |
-| 7   | GPU PoW Grinding + buffer caching  | Up to 2.58x total               |
-| 8   | Fused transpose+pad+DFT+Merkle     | Eliminates transpose overhead   |
-| 9   | Adaptive GPU dispatch bounds       | Avoids GPU regressions          |
-| 10  | Adaptive PoW batch size            | Reduces dispatch overhead       |
-| 11  | Shared-memory DIF tail             | **33% fewer global mem passes** |
-| 12  | 4096-element shared-memory tail    | 1 fewer pass for n=20,24        |
-| 13  | Lower GPU dispatch threshold       | Mid-size rounds use GPU Merkle  |
-| 14  | Parallel zero-copy Merkle readback | **2.3x faster readback**        |
-| 15  | Arc sharing + alloc elimination    | Small-n overhead eliminated     |
-| 16  | Fused leaf hash + first compress   | Eliminates 128MB read for n=22  |
-| 17  | Contiguous Merkle buffer pool      | 20+ allocs → 1 per Merkle tree |
-| 18  | Zero-copy Merkle digest layers     | Eliminates ~256MB memcpy        |
-| 19  | GPU transpose+pad in fused pipeline| CPU scatter-write → GPU kernel  |
-| 20  | Min-bytes GPU threshold + zero-copy EF | Skip GPU for tiny rounds     |
+| #   | Optimization                           | Key improvement                 |
+| --- | -------------------------------------- | ------------------------------- |
+| 1   | GPU NTT (Metal)                        | Established GPU pipeline        |
+| 2   | Radix-16 DIF + zero-copy               | 4x fewer dispatches, no memcpy  |
+| 3   | GPU Poseidon2 Merkle                   | ~10% whir_prove speedup         |
+| 4   | Fused DFT→Merkle                       | ~15-18% additional speedup      |
+| 5   | Fused prover rounds                    | Up to 1.63x total               |
+| 6   | Lower threshold + zero-copy bitrev     | Up to 1.88x total               |
+| 7   | GPU PoW Grinding + buffer caching      | Up to 2.58x total               |
+| 8   | Fused transpose+pad+DFT+Merkle         | Eliminates transpose overhead   |
+| 9   | Adaptive GPU dispatch bounds           | Avoids GPU regressions          |
+| 10  | Adaptive PoW batch size                | Reduces dispatch overhead       |
+| 11  | Shared-memory DIF tail                 | **33% fewer global mem passes** |
+| 12  | 4096-element shared-memory tail        | 1 fewer pass for n=20,24        |
+| 13  | Lower GPU dispatch threshold           | Mid-size rounds use GPU Merkle  |
+| 14  | Parallel zero-copy Merkle readback     | **2.3x faster readback**        |
+| 15  | Arc sharing + alloc elimination        | Small-n overhead eliminated     |
+| 16  | Fused leaf hash + first compress       | Eliminates 128MB read for n=22  |
+| 17  | Contiguous Merkle buffer pool          | 20+ allocs → 1 per Merkle tree  |
+| 18  | Zero-copy Merkle digest layers         | Eliminates ~256MB memcpy        |
+| 19  | GPU transpose+pad in fused pipeline    | CPU scatter-write → GPU kernel  |
+| 20  | Min-bytes GPU threshold + zero-copy EF | Skip GPU for tiny rounds        |
 
 
 ---
@@ -1279,29 +1279,27 @@ kept alive by an opaque keepalive handle stored in the `MerkleTree` struct.
 ### How it works
 
 1. **Patched `MerkleTree`** gains `gpu_backed_layers` and `_keepalive`
-   fields (both `#[serde(skip)]`). A custom `Drop` implementation
+  fields (both `#[serde(skip)]`). A custom `Drop` implementation
    `std::mem::forget`s the GPU-backed layers to prevent Rust from calling
    `dealloc` on Metal-managed memory.
-
-2. **`read_merkle_layers_zero_copy`** replaces `read_merkle_layers`. Instead
-   of memcpy, it creates Vecs via `Vec::from_raw_parts` pointing into the
+2. `**read_merkle_layers_zero_copy**` replaces `read_merkle_layers`. Instead
+  of memcpy, it creates Vecs via `Vec::from_raw_parts` pointing into the
    Metal buffer and moves the `Buffer` into a `Box<dyn Any + Send + Sync>`
    keepalive.
-
-3. **`GpuMerkleResult`** bundles the cap, digest layers, arity schedule,
-   and GPU-backing info. Its `into_tree()` method constructs the
+3. `**GpuMerkleResult**` bundles the cap, digest layers, arity schedule,
+  and GPU-backing info. Its `into_tree()` method constructs the
    `MerkleTree` with the correct backing (GPU or owned) transparently.
 
 ### Why it helps
 
 - **No memcpy**: Eliminates copying all Merkle digest layers (~256MB for
-  n=22, ~1GB for n=24) from Metal buffer to Rust heap.
+n=22, ~1GB for n=24) from Metal buffer to Rust heap.
 - **Lower peak memory**: No duplicate of digest data in both Metal buffer
-  and Rust heap.
+and Rust heap.
 - **Apple Silicon unified memory**: Metal `StorageModeShared` buffers are
-  directly CPU-accessible with no coherency overhead after GPU completion.
+directly CPU-accessible with no coherency overhead after GPU completion.
 - **Random access is fine**: Opening proofs access O(log n) digests per
-  query — the sporadic cache misses on Metal buffer memory are negligible.
+query — the sporadic cache misses on Metal buffer memory are negligible.
 
 ### Impact
 
@@ -1384,9 +1382,10 @@ GPU: DFT → Merkle
 ```
 
 The CPU transpose involved:
+
 1. `dst_slice.fill(BabyBear::ZERO)` — zeroing the entire output buffer
 2. Nested loop with scattered writes: for each output row, gather from non-contiguous
-   source positions across `in_rows × in_cols × elem_size` elements
+  source positions across `in_rows × in_cols × elem_size` elements
 
 For n=24, this meant zeroing and writing into a ~64MB buffer with poor cache locality.
 
@@ -1405,13 +1404,13 @@ synchronization points.
 ### Why it helps
 
 - **Eliminates CPU scattered writes**: The transpose pattern has poor cache locality
-  (strided access across `elem_size` granularity). The GPU handles this natively.
+(strided access across `elem_size` granularity). The GPU handles this natively.
 - **Eliminates CPU zero-fill**: No need to zero the output buffer; the GPU kernel
-  writes zeros for padded rows directly.
+writes zeros for padded rows directly.
 - **Smaller upload**: Only the source data is uploaded (`in_rows × in_cols × elem_size`),
-  not the full padded output.
+not the full padded output.
 - **Better pipeline fusion**: Transpose, DFT, and Merkle all execute in one command
-  buffer with no CPU synchronization between stages.
+buffer with no CPU synchronization between stages.
 
 ### GPU/CPU speedup after Optimization 19
 
@@ -1466,6 +1465,7 @@ synchronization points.
 | 6    | **1.39x** | **1.81x** | **3.18x** |
 | 8    | —         | —         | —         |
 
+
 ### Impact
 
 The optimization primarily benefits the `gpu_transpose_dft_and_merkle` code path,
@@ -1477,7 +1477,6 @@ memory. The GPU kernel eliminates the zero-fill overhead and improves pipeline f
 but the transpose itself was not the dominant bottleneck. The structural improvement
 ensures no CPU synchronization between transpose and DFT stages.
 
-
 ---
 
 ## Optimization 20 — Min-bytes GPU Threshold + Zero-copy Extension Field Data
@@ -1487,12 +1486,11 @@ ensures no CPU synchronization between transpose and DFT stages.
 Two changes:
 
 1. **GPU minimum total-bytes threshold**: Added `GPU_MIN_TOTAL_BYTES = 256KB` check to all
-   GPU entry points (`gpu_dft_and_merkle`, `gpu_transpose_dft_and_merkle`,
+  GPU entry points (`gpu_dft_and_merkle`, `gpu_transpose_dft_and_merkle`,
    `try_gpu_dft_inplace`). Matrices smaller than 256KB automatically fall back to CPU,
    avoiding Metal command buffer overhead (~2ms) for work that completes in <1ms on CPU.
-
 2. **Zero-copy extension field data**: Eliminated `data.to_vec()` allocation+copy in
-   `transpose_pad_dft_algebra_and_commit` by reinterpreting `&[EF]` directly as
+  `transpose_pad_dft_algebra_and_commit` by reinterpreting `&[EF]` directly as
    `&[BabyBear]` via pointer cast, since `BinomialExtensionField<BabyBear, 4>` has
    identical memory layout to `[BabyBear; 4]`.
 
@@ -1500,6 +1498,7 @@ Two changes:
 
 In the fused prover flow (`prove_fused`), later rounds operate on progressively smaller
 matrices. For example, with n=24, fold=3, the round sizes are:
+
 - Round 0: log_size=21 → ~128MB matrix (GPU efficient)
 - Round 1: log_size=18 → ~16MB matrix (GPU efficient)
 - Round 2: log_size=15 → ~2MB matrix (GPU borderline)
@@ -1566,10 +1565,12 @@ For round 0 at n=24, this avoids copying ~32MB of extension field data.
 | 6    | **1.64x** | **1.48x** | **2.13x** |
 | 8    | —         | —         | —         |
 
+
 ### Impact
 
 The minimum-bytes threshold eliminates GPU dispatch overhead for the smallest rounds
 in the fused prover. Key improvements:
+
 - **n=18, fold=1, rate=1**: 1.11x → **1.31x** (18% improvement)
 - **n=18, fold=3, rate=1**: 0.64x → **0.93x** (45% improvement, no longer a regression)
 - **n=20, fold=2, rate=1**: 1.46x → **1.57x** (8% improvement)
@@ -1587,25 +1588,26 @@ algebra round, providing a small but consistent improvement across all configura
 Two changes:
 
 1. **Fix a segfault in `GpuMmcs::commit`**: The contiguity check compared pointers
-   from `FlatMatrixView::row_slice()`, which allocates a *new* `Vec` per call. Two
+  from `FlatMatrixView::row_slice()`, which allocates a *new* `Vec` per call. Two
    independent heap allocations could accidentally appear adjacent, causing the check
    to pass and `from_raw_parts(ptr, height*width)` to read far past the allocation.
    The fix verifies pointer stability (same pointer from two calls to `row_slice(0)`)
    before trusting the adjacency check.
-
 2. **XL shared-memory DIF kernel** (`bb_dif_shared_bitrev_xl`): Handles blocks of up
-   to 8192 elements (`log_block=13`) using 8 elements/thread and 32KB threadgroup
+  to 8192 elements (`log_block=13`) using 8 elements/thread and 32KB threadgroup
    memory. This extends the shared-memory DIF tail from `log_block≤12` to `log_block≤13`,
    eliminating one additional global memory pass for DFTs with 13+ stages.
 
 ### Before → After
 
-| Aspect | Before (Opt 20) | After (Opt 21) |
-|--------|-----------------|----------------|
-| `max_log_shared_block` | 12 (4096 elements) | 13 (8192 elements) |
-| Shared memory per block | 16 KB | 32 KB |
-| Elements per thread | 4 | 8 |
+
+| Aspect                       | Before (Opt 20)             | After (Opt 21)                 |
+| ---------------------------- | --------------------------- | ------------------------------ |
+| `max_log_shared_block`       | 12 (4096 elements)          | 13 (8192 elements)             |
+| Shared memory per block      | 16 KB                       | 32 KB                          |
+| Elements per thread          | 4                           | 8                              |
 | `GpuMmcs::commit` contiguity | Unsafe for `FlatMatrixView` | Safe (pointer stability check) |
+
 
 ### Why it helps
 
@@ -1619,45 +1621,52 @@ memory traffic and eliminates one DIF pass for affected sizes.
 
 ##### n=18
 
+
 | fold | rate=1 | rate=2 |
-|------|--------|--------|
+| ---- | ------ | ------ |
 | 3    | 0.85x  | 1.44x  |
 | 4    | 0.96x  | 1.00x  |
 | 6    | 0.67x  | 0.81x  |
 | 8    | 0.51x  | 0.64x  |
 
+
 ##### n=20
 
+
 | fold | rate=1    | rate=2    |
-|------|-----------|-----------|
+| ---- | --------- | --------- |
 | 3    | **1.29x** | **1.64x** |
 | 4    | **1.12x** | **1.54x** |
 | 6    | **1.01x** | **1.24x** |
 | 8    | 0.91x     | **1.20x** |
 
+
 ##### n=22
 
+
 | fold | rate=1    | rate=2    |
-|------|-----------|-----------|
+| ---- | --------- | --------- |
 | 3    | **1.56x** | **1.75x** |
 | 4    | **1.59x** | **1.52x** |
 | 6    | **1.44x** | **1.11x** |
 | 8    | **1.55x** | **1.36x** |
 
+
 ##### n=24
 
+
 | fold | rate=1    | rate=2    |
-|------|-----------|-----------|
+| ---- | --------- | --------- |
 | 3    | **1.66x** | **1.72x** |
 | 4    | **1.53x** | **1.77x** |
 | 6    | **1.37x** | **1.20x** |
 | 8    | 0.79x     | —         |
 
+
 ### Impact
 
 The contiguity bugfix eliminates a latent segfault that affected configurations
-where `GpuMmcs::commit` received a `FlatMatrixView` matrix (most notably `n=22,
-fold=8`). This was a heap-dependent crash that could also corrupt GPU results
+where `GpuMmcs::commit` received a `FlatMatrixView` matrix (most notably `n=22, fold=8`). This was a heap-dependent crash that could also corrupt GPU results
 silently.
 
 The XL kernel provides modest improvement for DFTs with `log_n ∈ [13, 14]` where
@@ -1676,6 +1685,7 @@ to `[BabyBear; 4]`, so Vec pointer casts via `from_raw_parts` replace 256MB copi
 for large polynomials.
 
 Applied in three functions:
+
 - `dft_algebra_and_commit` (both EF→BB and BB→EF)
 - `dft_algebra_and_commit_matrix` (both directions)
 - `transpose_pad_dft_algebra_and_commit` (BB→EF return path)
@@ -1684,19 +1694,23 @@ Applied in three functions:
 
 ##### n=22
 
+
 | fold | rate=1    | rate=2    | rate=3    |
-|------|-----------|-----------|-----------|
+| ---- | --------- | --------- | --------- |
 | 3    | **1.59x** | **1.59x** | **1.76x** |
 | 4    | **1.45x** | **1.53x** | **1.26x** |
 | 6    | **1.19x** | **2.47x** | **1.23x** |
 
+
 ##### n=24
 
+
 | fold | rate=1    | rate=2    | rate=3    |
-|------|-----------|-----------|-----------|
+| ---- | --------- | --------- | --------- |
 | 3    | **1.96x** | **1.80x** | **1.50x** |
 | 4    | **1.11x** | **1.34x** | 0.51x     |
 | 6    | **1.30x** | **1.20x** | **1.12x** |
+
 
 ### Key observations
 
@@ -1719,28 +1733,28 @@ cancellation signal to stop the slower searcher once the faster one finds a witn
 
 ### What changed
 
-1. **`cpu_pow_grind_cancellable`** — New standalone function reimplementing
-   `DuplexChallenger::grind` with an `AtomicBool` flag checked in the rayon
+1. `**cpu_pow_grind_cancellable*`* — New standalone function reimplementing
+  `DuplexChallenger::grind` with an `AtomicBool` flag checked in the rayon
    `find_map_any` closure for early termination.
-
-2. **`gpu_pow_grind_cancellable`** — Like `gpu_pow_grind`, but checks the
-   cancellation flag between Metal batch dispatches and signals it upon finding
+2. `**gpu_pow_grind_cancellable**` — Like `gpu_pow_grind`, but checks the
+  cancellation flag between Metal batch dispatches and signals it upon finding
    a winner.
-
-3. **`GpuChallenger::grind`** — For `bits < 20`, delegates directly to the
-   CPU `DuplexChallenger::grind` (GPU dispatch overhead exceeds the PoW search
+3. `**GpuChallenger::grind**` — For `bits < 20`, delegates directly to the
+  CPU `DuplexChallenger::grind` (GPU dispatch overhead exceeds the PoW search
    time). For `bits >= 20`, spawns a CPU thread while running GPU grind on the
    main thread (Metal objects aren't `Send`). Whichever finds the witness first
    cancels the other.
 
 ### Threshold analysis
 
+
 | pow_bits | Expected trials | CPU rayon+SIMD time | GPU dispatch overhead |
-|----------|-----------------|---------------------|-----------------------|
+| -------- | --------------- | ------------------- | --------------------- |
 | 12       | 4,096           | ~1 μs               | ~100 μs               |
 | 16       | 65,536          | ~16 μs              | ~100 μs               |
 | 20       | 1,048,576       | ~2.5 ms             | ~100 μs               |
 | 24       | 16,777,216      | ~40 ms              | ~100 μs               |
+
 
 With `DEFAULT_MAX_POW = 16`, all per-round pow_bits are ≤ 16, so the CPU
 grind path is always taken. The concurrent path activates only for applications
@@ -1750,24 +1764,28 @@ that set higher pow_bits (≥ 20).
 
 ##### n=22
 
+
 | fold | rate=1    | rate=2    | rate=3    |
-|------|-----------|-----------|-----------|
+| ---- | --------- | --------- | --------- |
 | 3    | **1.57x** | **1.80x** | **1.37x** |
 | 4    | **1.62x** | **1.52x** | **1.49x** |
 | 6    | **1.34x** | 1.00x     | **1.41x** |
 
+
 ##### n=24
 
+
 | fold | rate=1    | rate=2    | rate=3    |
-|------|-----------|-----------|-----------|
+| ---- | --------- | --------- | --------- |
 | 3    | **1.66x** | **1.69x** | **1.43x** |
 | 4    | 1.01x     | **1.18x** | 1.03x     |
 | 6    | **1.15x** | **1.50x** | **1.22x** |
 
+
 ### Key observations
 
 - **No regressions**: All configs show GPU ≥ CPU (previous 0.51x outlier at
-  n=24/f=4/r=3 was PoW randomness, not a systematic issue)
+n=24/f=4/r=3 was PoW randomness, not a systematic issue)
 - **Best speedup**: **1.80x** at n=22, fold=3, rate=2
 - **Bottleneck analysis** (from tracing profile of n=24/f=3/r=1):
   - Initial GPU commit (DFT + Merkle): **212 ms** (41% of total)
@@ -1776,6 +1794,88 @@ that set higher pow_bits (≥ 20).
   - Initialization (`new_svo`): **29 ms** (6%)
   - Remaining rounds GPU + CPU: **154 ms** (30%)
 - The GPU pipeline is **compute-bound** on Poseidon2 Montgomery multiplication
-  (`mulhi` emulation on Apple Silicon GPU), not memory-bandwidth-bound
+(`mulhi` emulation on Apple Silicon GPU), not memory-bandwidth-bound
 - For high-rate configs (r=3), `compute_sumcheck_polynomials` dominates total
-  time (up to 95% in later rounds), limiting achievable GPU speedup
+time (up to 95% in later rounds), limiting achievable GPU speedup
+
+---
+
+## Optimization 24 — 4-leaf Fused Merkle Kernel + GPU Phase Profiling
+
+### Purpose
+
+Reduce Merkle tree construction overhead by fusing 3 Merkle levels into a single
+GPU kernel. GPU profiling confirmed Merkle tree (Poseidon2 hashing) is the
+dominant bottleneck: ~70% of initial commit time.
+
+### GPU phase profiling results (n=24, f=3, r=1)
+
+| Phase | Time | % of total |
+|-------|------|------------|
+| Transpose + DFT (log_n=22, width=8) | 51–75 ms | ~25% |
+| Merkle tree (4M leaves) | 171–224 ms | ~70% |
+| DFT output memcpy (128 MB) | 10–30 ms | ~5% |
+
+### What changed
+
+1. **`poseidon2_hash4_compress3`** — New Metal kernel that processes 4 adjacent
+   leaves per thread:
+   - Hashes 4 leaves (4 Poseidon2 permutations)
+   - Writes all 4 leaf digests to the leaf buffer
+   - Compresses pair (0,1) → parent_01 (in registers)
+   - Compresses pair (2,3) → parent_23 (in registers)
+   - Writes both parent digests to level-1 buffer
+   - Compresses (parent_01, parent_23) → grandparent (in registers)
+   - Writes grandparent to level-2 buffer
+   - Total: 7 Poseidon2 permutations per thread
+
+2. **`encode_merkle_tree`** — Updated to use the 4-leaf kernel when
+   `num_leaves >= 4`, fusing the first 3 Merkle levels (leaf hash + 2 compress
+   levels) into a single dispatch. Falls back to the 2-leaf kernel for
+   smaller trees.
+
+3. **GPU phase profiling** — Added `GPU_PROFILE=1` environment variable that
+   splits `gpu_transpose_dft_and_merkle` into separate command buffers for
+   DFT and Merkle phases, printing per-phase timing to stderr.
+
+### Benefits
+
+- Eliminates one global memory round-trip for level-1 intermediate digests
+  (kept in registers instead)
+- Reduces number of kernel dispatches by 1
+- Increases per-thread work, improving ALU utilization through instruction
+  interleaving across independent Poseidon2 computations within each thread
+
+### Benchmark — GPU / CPU speedup (gpu_fused mode, all optimizations)
+
+##### n=22
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 1    | **1.76x** | **2.07x** | **2.14x** |
+| 2    | **1.65x** | **1.88x** | **2.03x** |
+| 3    | **1.81x** | **1.76x** | **1.70x** |
+| 4    | **1.69x** | **1.58x** | **1.51x** |
+| 6    | **1.43x** | **1.11x** | **1.34x** |
+
+##### n=24
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 1    | **1.93x** | **2.16x** | **1.53x** |
+| 2    | **1.79x** | **2.02x** | **2.22x** |
+| 3    | **1.66x** | **1.71x** | **1.83x** |
+| 4    | **1.51x** | **1.56x** | **1.53x** |
+| 6    | **1.37x** | **1.30x** | 0.94x     |
+
+### Key observations
+
+- **Best speedup**: **2.22x** at n=24, fold=2, rate=3
+- **Significant improvement** at n=24/f=4/r=1: from 1.01x → **1.51x** (+50%)
+- **n=22 rates 2-3** consistently above **2x** for small fold factors
+- **n=24/f=6/r=3** is the only regression (0.94x) — this config is dominated
+  by CPU sumcheck and has very small per-round DFT sizes where GPU dispatch
+  overhead exceeds compute savings
+- The 4-leaf fusion primarily helps large-DFT configs where Merkle tree
+  construction is the dominant cost
+

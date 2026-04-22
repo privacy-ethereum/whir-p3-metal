@@ -2358,6 +2358,125 @@ kernel void poseidon2_hash_and_compress(
     for (uint i = 0; i < 8; i++) parents[out_start + i] = state[i];
 }
 
+// ── Fused 4-leaf hash + 3-level compress ──────────────────────────────
+// Each thread processes 4 adjacent leaves (a quad), writes all 4 leaf
+// digests, compresses them through 2 Merkle levels in registers, and
+// writes the 2 parent digests + 1 grandparent digest.
+//
+// Fuses leaf hashing + level-0→1 compress + level-1→2 compress,
+// eliminating global memory round-trips for the intermediate level-1
+// digests.
+//
+// Thread gid handles leaves 4*gid .. 4*gid+3.
+kernel void poseidon2_hash4_compress3(
+    device const Bb* data        [[buffer(0)]],
+    device Bb* leaf_digests      [[buffer(1)]],
+    device Bb* parents           [[buffer(2)]],
+    device Bb* grandparents      [[buffer(3)]],
+    constant Bb* rc              [[buffer(4)]],
+    constant uint& num_quads     [[buffer(5)]],
+    constant uint& leaf_width    [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= num_quads) return;
+
+    Bb d0[8], d1[8], d2[8], d3[8];
+
+    // Hash leaf 4*gid+0
+    {
+        Bb st[16] = {};
+        uint base = (4 * gid) * leaf_width;
+        for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+            uint rem = min(8u, leaf_width - absorbed);
+            for (uint i = 0; i < rem; i++) st[i] = data[base + absorbed + i];
+            if (rem < 8) for (uint i = rem; i < 8; i++) st[i] = Bb{0};
+            poseidon2_permute_16(st, rc);
+        }
+        for (uint i = 0; i < 8; i++) d0[i] = st[i];
+        uint out = (4 * gid) * 8;
+        for (uint i = 0; i < 8; i++) leaf_digests[out + i] = st[i];
+    }
+
+    // Hash leaf 4*gid+1
+    {
+        Bb st[16] = {};
+        uint base = (4 * gid + 1) * leaf_width;
+        for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+            uint rem = min(8u, leaf_width - absorbed);
+            for (uint i = 0; i < rem; i++) st[i] = data[base + absorbed + i];
+            if (rem < 8) for (uint i = rem; i < 8; i++) st[i] = Bb{0};
+            poseidon2_permute_16(st, rc);
+        }
+        for (uint i = 0; i < 8; i++) d1[i] = st[i];
+        uint out = (4 * gid + 1) * 8;
+        for (uint i = 0; i < 8; i++) leaf_digests[out + i] = st[i];
+    }
+
+    // Compress pair (d0, d1) → parent_01
+    Bb p01[8];
+    {
+        Bb st[16];
+        for (uint i = 0; i < 8; i++) st[i] = d0[i];
+        for (uint i = 0; i < 8; i++) st[8 + i] = d1[i];
+        poseidon2_permute_16(st, rc);
+        for (uint i = 0; i < 8; i++) p01[i] = st[i];
+        uint out = (2 * gid) * 8;
+        for (uint i = 0; i < 8; i++) parents[out + i] = st[i];
+    }
+
+    // Hash leaf 4*gid+2
+    {
+        Bb st[16] = {};
+        uint base = (4 * gid + 2) * leaf_width;
+        for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+            uint rem = min(8u, leaf_width - absorbed);
+            for (uint i = 0; i < rem; i++) st[i] = data[base + absorbed + i];
+            if (rem < 8) for (uint i = rem; i < 8; i++) st[i] = Bb{0};
+            poseidon2_permute_16(st, rc);
+        }
+        for (uint i = 0; i < 8; i++) d2[i] = st[i];
+        uint out = (4 * gid + 2) * 8;
+        for (uint i = 0; i < 8; i++) leaf_digests[out + i] = st[i];
+    }
+
+    // Hash leaf 4*gid+3
+    {
+        Bb st[16] = {};
+        uint base = (4 * gid + 3) * leaf_width;
+        for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+            uint rem = min(8u, leaf_width - absorbed);
+            for (uint i = 0; i < rem; i++) st[i] = data[base + absorbed + i];
+            if (rem < 8) for (uint i = rem; i < 8; i++) st[i] = Bb{0};
+            poseidon2_permute_16(st, rc);
+        }
+        for (uint i = 0; i < 8; i++) d3[i] = st[i];
+        uint out = (4 * gid + 3) * 8;
+        for (uint i = 0; i < 8; i++) leaf_digests[out + i] = st[i];
+    }
+
+    // Compress pair (d2, d3) → parent_23
+    Bb p23[8];
+    {
+        Bb st[16];
+        for (uint i = 0; i < 8; i++) st[i] = d2[i];
+        for (uint i = 0; i < 8; i++) st[8 + i] = d3[i];
+        poseidon2_permute_16(st, rc);
+        for (uint i = 0; i < 8; i++) p23[i] = st[i];
+        uint out = (2 * gid + 1) * 8;
+        for (uint i = 0; i < 8; i++) parents[out + i] = st[i];
+    }
+
+    // Compress (parent_01, parent_23) → grandparent
+    {
+        Bb st[16];
+        for (uint i = 0; i < 8; i++) st[i] = p01[i];
+        for (uint i = 0; i < 8; i++) st[8 + i] = p23[i];
+        poseidon2_permute_16(st, rc);
+        uint out = gid * 8;
+        for (uint i = 0; i < 8; i++) grandparents[out + i] = st[i];
+    }
+}
+
 // ── GPU Proof-of-Work (PoW) grinding ──────────────────────────────────
 // Parallel brute-force search for a valid PoW witness.
 // Each thread tries one candidate nonce, applies Poseidon2 permutation,
