@@ -288,6 +288,7 @@ pub struct MetalInner {
     poseidon2_rc_buf: Buffer,
     buf_copy_ps: ComputePipelineState,
     pow_bufs: Mutex<PowBuffers>,
+    merkle_buf_cache: Mutex<Option<Buffer>>,
 }
 
 struct PowBuffers {
@@ -317,6 +318,18 @@ impl std::ops::Deref for MetalBabyBearDft {
     fn deref(&self) -> &MetalInner {
         &self.inner
     }
+}
+
+const MERKLE_OFFSET_ALIGN: u64 = 256;
+
+struct MerkleLayers {
+    buf: Buffer,
+    offsets: Vec<u64>,
+    num_digests: Vec<u32>,
+}
+
+fn align_up(x: u64, align: u64) -> u64 {
+    (x + align - 1) & !(align - 1)
 }
 
 impl MetalBabyBearDft {
@@ -477,6 +490,7 @@ impl MetalBabyBearDft {
             poseidon2_rc_buf,
             buf_copy_ps,
             pow_bufs: Mutex::new(pow_bufs),
+            merkle_buf_cache: Mutex::new(None),
         })}
     }
 
@@ -734,75 +748,81 @@ impl MetalBabyBearDft {
         num_leaves: u32,
         leaf_width: u32,
     ) -> Vec<Vec<u32>> {
-        let layers = autoreleasepool(|| {
+        let merkle = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            let layers = self.encode_merkle_tree(&enc, data_buf, num_leaves, leaf_width);
+            let merkle = self.encode_merkle_tree(&enc, data_buf, num_leaves, leaf_width);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
-            layers
+            merkle
         });
 
-        layers
+        let base_ptr = merkle.buf.contents() as *const u8;
+        let result = merkle.num_digests
             .iter()
-            .map(|buf| {
-                let count = buf.length() as usize / size_of::<u32>();
-                let mut v = vec![0u32; count];
+            .zip(merkle.offsets.iter())
+            .map(|(&count, &offset)| {
+                let num_u32s = count as usize * 8;
+                let mut v = vec![0u32; num_u32s];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        buf.contents() as *const u32,
+                        base_ptr.add(offset as usize) as *const u32,
                         v.as_mut_ptr(),
-                        count,
+                        num_u32s,
                     );
                 }
                 v
             })
-            .collect()
+            .collect();
+        self.release_merkle_layers(merkle);
+        result
     }
 
     /// Encode Poseidon2 Merkle tree dispatches into an existing encoder.
-    /// Returns the pre-allocated layer buffers (caller must wait on the
-    /// command buffer before reading them).
+    /// All digest layers are packed into a single contiguous Metal buffer
+    /// to avoid per-layer allocation overhead (20+ allocs → 1).
     fn encode_merkle_tree(
         &self,
         enc: &ComputeCommandEncoderRef,
         data_buf: &metal::BufferRef,
         num_leaves: u32,
         leaf_width: u32,
-    ) -> Vec<Buffer> {
-        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
-            | MTLResourceOptions::StorageModeShared;
+    ) -> MerkleLayers {
         let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
             enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
         };
-        let digest_elems = 8u32;
+        let digest_elems = 8u64;
+        let elem_bytes = size_of::<u32>() as u64;
 
-        let mut layers: Vec<Buffer> = Vec::new();
-        let leaf_buf = self.device.new_buffer(
-            u64::from(num_leaves) * u64::from(digest_elems) * (size_of::<u32>() as u64),
-            opts,
-        );
-        layers.push(leaf_buf);
-
-        let mut current_count = num_leaves;
-        while current_count > 1 {
-            let pairs = current_count / 2;
-            layers.push(self.device.new_buffer(
-                u64::from(pairs) * u64::from(digest_elems) * (size_of::<u32>() as u64),
-                opts,
-            ));
-            current_count = pairs;
+        let mut layer_counts: Vec<u32> = Vec::new();
+        layer_counts.push(num_leaves);
+        let mut c = num_leaves;
+        while c > 1 {
+            c /= 2;
+            layer_counts.push(c);
         }
+
+        let mut offsets: Vec<u64> = Vec::with_capacity(layer_counts.len());
+        let mut cursor: u64 = 0;
+        for &count in &layer_counts {
+            offsets.push(cursor);
+            let layer_bytes = u64::from(count) * digest_elems * elem_bytes;
+            cursor = align_up(cursor + layer_bytes, MERKLE_OFFSET_ALIGN);
+        }
+        let total_bytes = cursor;
+
+        let buf = Self::acquire_buf(&self.merkle_buf_cache, &self.device, total_bytes);
+
         let start_layer;
-        if num_leaves >= 2 && layers.len() >= 2 {
+        if num_leaves >= 2 && layer_counts.len() >= 2 {
             let pairs = num_leaves / 2;
             let max_tg = self.poseidon2_hash_and_compress_ps
                 .max_total_threads_per_threadgroup() as u64;
             enc.set_compute_pipeline_state(&self.poseidon2_hash_and_compress_ps);
             enc.set_buffer(0, Some(data_buf), 0);
-            enc.set_buffer(1, Some(&layers[0]), 0);
-            enc.set_buffer(2, Some(&layers[1]), 0);
+            enc.set_buffer(1, Some(&buf), offsets[0]);
+            enc.set_buffer(2, Some(&buf), offsets[1]);
             enc.set_buffer(3, Some(&self.poseidon2_rc_buf), 0);
             set_u32(enc, 4, pairs);
             set_u32(enc, 5, leaf_width);
@@ -816,7 +836,7 @@ impl MetalBabyBearDft {
                 self.poseidon2_hash_leaves_ps.max_total_threads_per_threadgroup() as u64;
             enc.set_compute_pipeline_state(&self.poseidon2_hash_leaves_ps);
             enc.set_buffer(0, Some(data_buf), 0);
-            enc.set_buffer(1, Some(&layers[0]), 0);
+            enc.set_buffer(1, Some(&buf), offsets[0]);
             enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
             set_u32(enc, 3, num_leaves);
             set_u32(enc, 4, leaf_width);
@@ -827,15 +847,14 @@ impl MetalBabyBearDft {
             start_layer = 1;
         }
 
-        // Compression layers (starting after the fused level)
         let max_tg_compress =
             self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
-        current_count = if start_layer == 2 { num_leaves / 2 } else { num_leaves };
-        for layer_idx in start_layer..layers.len() {
+        let mut current_count = if start_layer == 2 { num_leaves / 2 } else { num_leaves };
+        for layer_idx in start_layer..layer_counts.len() {
             let pairs = current_count / 2;
             enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
-            enc.set_buffer(0, Some(&layers[layer_idx - 1]), 0);
-            enc.set_buffer(1, Some(&layers[layer_idx]), 0);
+            enc.set_buffer(0, Some(&buf), offsets[layer_idx - 1]);
+            enc.set_buffer(1, Some(&buf), offsets[layer_idx]);
             enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
             set_u32(enc, 3, pairs);
             enc.dispatch_threads(
@@ -845,23 +864,26 @@ impl MetalBabyBearDft {
             current_count = pairs;
         }
 
-        layers
+        MerkleLayers { buf, offsets, num_digests: layer_counts }
     }
 
-    /// Convert GPU layer buffers into the digest_layers / cap format.
-    /// Uses direct reinterpret-cast (BabyBear is repr(transparent) over u32)
-    /// and parallel memcpy for large layers to maximize readback bandwidth.
-    fn read_merkle_layers(layers: &[Buffer]) -> (
+    fn release_merkle_layers(&self, layers: MerkleLayers) {
+        Self::release_buf(&self.merkle_buf_cache, layers.buf);
+    }
+
+    /// Convert a contiguous GPU Merkle buffer into digest_layers / cap format.
+    fn read_merkle_layers(layers: &MerkleLayers) -> (
         p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
         Vec<Vec<[BabyBear; 8]>>,
         Vec<usize>,
     ) {
-        use rayon::prelude::*;
+        let base_ptr = layers.buf.contents() as *const u8;
 
-        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers
+        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers.num_digests
             .iter()
-            .map(|buf| {
-                let num_digests = buf.length() as usize / (8 * size_of::<u32>());
+            .zip(layers.offsets.iter())
+            .map(|(&count, &offset)| {
+                let num_digests = count as usize;
                 let mut digests: Vec<[BabyBear; 8]> = Vec::with_capacity(num_digests);
                 unsafe { digests.set_len(num_digests); }
 
@@ -869,7 +891,7 @@ impl MetalBabyBearDft {
                 unsafe {
                     fast_memcpy_from_gpu(
                         digests.as_mut_ptr().cast::<u8>(),
-                        buf.contents() as *const u8,
+                        base_ptr.add(offset as usize),
                         byte_len,
                     );
                 }
@@ -928,17 +950,16 @@ impl MetalBabyBearDft {
 
         let use_four_step = self.use_four_step(log_n);
 
-        let result = autoreleasepool(|| {
+        let gpu_result: Option<(bool, MerkleLayers)> = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
 
             if let Some(ref zc_buf) = zc_input {
                 if use_four_step {
-                    // Four-step path: zc→temp→zc (natural order), then Merkle
                     let temp = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
                     self.encode_four_step_ntt_oop(&enc, zc_buf, zc_buf, &temp, &tw,
                         log_n, height as u32, width as u32);
-                    let merkle_layers = self.encode_merkle_tree(
+                    let merkle = self.encode_merkle_tree(
                         &enc, zc_buf, height as u32, width as u32,
                     );
                     enc.end_encoding();
@@ -946,12 +967,11 @@ impl MetalBabyBearDft {
                     cmd.wait_until_completed();
                     Self::release_buf(&self.temp_buf_cache, temp);
                     if cmd.status() == MTLCommandBufferStatus::Error {
+                        self.release_merkle_layers(merkle);
                         return None;
                     }
-                    Some(Self::read_merkle_layers(&merkle_layers))
+                    Some((false, merkle))
                 } else {
-                    // DIF path: partial global stages on managed, then shared-
-                    // memory tail + bitrev writes back to zc for Merkle.
                     let shared_lb = log_n.min(self.max_log_shared_block);
                     let global_stages = log_n - shared_lb;
                     if global_stages >= 4 {
@@ -976,16 +996,17 @@ impl MetalBabyBearDft {
                             height as u32, width as u32, 0, log_n, shared_lb,
                         );
                     }
-                    let merkle_layers = self.encode_merkle_tree(
+                    let merkle = self.encode_merkle_tree(
                         &enc, zc_buf, height as u32, width as u32,
                     );
                     enc.end_encoding();
                     cmd.commit();
                     cmd.wait_until_completed();
                     if cmd.status() == MTLCommandBufferStatus::Error {
+                        self.release_merkle_layers(merkle);
                         return None;
                     }
-                    Some(Self::read_merkle_layers(&merkle_layers))
+                    Some((false, merkle))
                 }
             } else {
                 let nat = natural_buf.as_ref().unwrap();
@@ -1007,13 +1028,14 @@ impl MetalBabyBearDft {
                     );
                     nat
                 };
-                let merkle_layers = self.encode_merkle_tree(
+                let merkle = self.encode_merkle_tree(
                     &enc, dft_out_buf, height as u32, width as u32,
                 );
                 enc.end_encoding();
                 cmd.commit();
                 cmd.wait_until_completed();
                 if cmd.status() == MTLCommandBufferStatus::Error {
+                    self.release_merkle_layers(merkle);
                     return None;
                 }
 
@@ -1025,7 +1047,7 @@ impl MetalBabyBearDft {
                     );
                 }
 
-                Some(Self::read_merkle_layers(&merkle_layers))
+                Some((true, merkle))
             }
         });
 
@@ -1033,7 +1055,12 @@ impl MetalBabyBearDft {
         if let Some(buf) = natural_buf {
             Self::release_buf(&self.temp_buf_cache, buf);
         }
-        result
+
+        gpu_result.map(|(_, merkle)| {
+            let result = Self::read_merkle_layers(&merkle);
+            self.release_merkle_layers(merkle);
+            result
+        })
     }
 
     /// Fused GPU transpose+pad → DFT → Merkle without CPU round-trip.
@@ -1091,7 +1118,7 @@ impl MetalBabyBearDft {
 
         let use_four_step = self.use_four_step(log_n);
 
-        let result = autoreleasepool(|| {
+        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>)> = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
 
@@ -1107,13 +1134,14 @@ impl MetalBabyBearDft {
                 &natural_buf
             };
 
-            let merkle_layers = self.encode_merkle_tree(
+            let merkle = self.encode_merkle_tree(
                 &enc, dft_out_buf, out_height as u32, out_width as u32,
             );
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
             if cmd.status() == MTLCommandBufferStatus::Error {
+                self.release_merkle_layers(merkle);
                 return None;
             }
 
@@ -1127,13 +1155,17 @@ impl MetalBabyBearDft {
                 );
             }
 
-            let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle_layers);
-            Some((out_values, cap, digest_layers, arity_schedule))
+            Some((merkle, out_values))
         });
 
         Self::release_buf(&self.data_buf_cache, dif_buf);
         Self::release_buf(&self.temp_buf_cache, natural_buf);
-        result
+
+        gpu_result.map(|(merkle, out_values)| {
+            let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle);
+            self.release_merkle_layers(merkle);
+            (out_values, cap, digest_layers, arity_schedule)
+        })
     }
 
     /// Encode just the DIF butterfly stages (no bitrev) with zero-copy input.
@@ -1387,19 +1419,21 @@ impl MetalBabyBearDft {
             opts,
         );
 
-        let layers = autoreleasepool(|| {
+        let merkle = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            let layers = self.encode_merkle_tree(
+            let merkle = self.encode_merkle_tree(
                 &enc, &data_buf, height as u32, width as u32,
             );
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
-            layers
+            merkle
         });
 
-        Self::read_merkle_layers(&layers)
+        let result = Self::read_merkle_layers(&merkle);
+        self.release_merkle_layers(merkle);
+        result
     }
 
     /// Build Merkle digest layers on GPU from a row-major matrix.
