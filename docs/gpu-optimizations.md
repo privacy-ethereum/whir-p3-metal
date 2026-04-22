@@ -1663,3 +1663,45 @@ silently.
 The XL kernel provides modest improvement for DFTs with `log_n ∈ [13, 14]` where
 the shared-memory tail now covers one more stage. The primary GPU speedup (1.5–1.8x
 for n≥22) comes from the cumulative effect of all optimizations.
+
+---
+
+## Optimization 22 — Zero-copy EF↔BabyBear Conversions
+
+### Purpose
+
+Eliminate all `flatten_to_base` / `reconstitute_from_base` allocations in the GPU
+commit pipeline. `BinomialExtensionField<BabyBear, 4>` has identical memory layout
+to `[BabyBear; 4]`, so Vec pointer casts via `from_raw_parts` replace 256MB copies
+for large polynomials.
+
+Applied in three functions:
+- `dft_algebra_and_commit` (both EF→BB and BB→EF)
+- `dft_algebra_and_commit_matrix` (both directions)
+- `transpose_pad_dft_algebra_and_commit` (BB→EF return path)
+
+### Final GPU / CPU speedup table (all optimizations combined)
+
+##### n=22
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 3    | **1.59x** | **1.59x** | **1.76x** |
+| 4    | **1.45x** | **1.53x** | **1.26x** |
+| 6    | **1.19x** | **2.47x** | **1.23x** |
+
+##### n=24
+
+| fold | rate=1    | rate=2    | rate=3    |
+|------|-----------|-----------|-----------|
+| 3    | **1.96x** | **1.80x** | **1.50x** |
+| 4    | **1.11x** | **1.34x** | 0.51x     |
+| 6    | **1.30x** | **1.20x** | **1.12x** |
+
+### Key observations
+
+- **Best speedup**: **2.47x** at n=22, fold=6, rate=2
+- **Best at n=24**: **1.96x** at n=24, fold=3, rate=1
+- GPU consistently wins for n≥22 with fold≤6 and rate≤2
+- High fold (8) + rate=3 can cause GPU regression due to enormous Merkle trees
+- Small problems (n≤18) generally favor CPU due to GPU dispatch overhead
