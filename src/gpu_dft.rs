@@ -1146,30 +1146,38 @@ impl MetalBabyBearDft {
         let dif_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
         let natural_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
 
-        {
-            let dst_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    dif_buf.contents() as *mut BabyBear, total_out,
-                )
-            };
-            dst_slice.fill(BabyBear::ZERO);
-            let src_slice = data;
-            dst_slice.par_chunks_mut(out_width).take(in_cols).enumerate().for_each(|(out_row, row)| {
-                for out_col in 0..in_rows {
-                    let src_base = (out_col * in_cols + out_row) * elem_size;
-                    let dst_offset = out_col * elem_size;
-                    for d in 0..elem_size {
-                        row[dst_offset + d] = src_slice[src_base + d];
-                    }
-                }
-            });
-        }
+        let src_bytes = (data.len() * size_of::<u32>()) as u64;
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+        let src_buf = self.device.new_buffer_with_data(
+            data.as_ptr().cast(), src_bytes, opts,
+        );
 
         let use_four_step = self.use_four_step(log_n);
 
         let gpu_result: Option<(MerkleLayers, Vec<BabyBear>)> = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
+
+            {
+                let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+                    enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+                };
+                enc.set_compute_pipeline_state(&self.transpose_pad_ps);
+                enc.set_buffer(0, Some(&src_buf), 0);
+                enc.set_buffer(1, Some(&dif_buf), 0);
+                set_u32(&enc, 2, in_rows as u32);
+                set_u32(&enc, 3, in_cols as u32);
+                set_u32(&enc, 4, out_height as u32);
+                set_u32(&enc, 5, elem_size as u32);
+                let tg = self.transpose_pad_ps.max_total_threads_per_threadgroup() as u64;
+                let tg_w = (in_rows as u64).min(16);
+                let tg_h = (tg / tg_w).min(64);
+                enc.dispatch_threads(
+                    MTLSize::new(in_rows as u64, out_height as u64, 1),
+                    MTLSize::new(tg_w, tg_h, 1),
+                );
+            }
 
             let dft_out_buf = if use_four_step {
                 self.encode_four_step_ntt(&enc, &dif_buf, &natural_buf, &tw,

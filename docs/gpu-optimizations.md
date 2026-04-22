@@ -1259,6 +1259,7 @@ compute-heavy configurations. No regressions observed.
 | 16  | Fused leaf hash + first compress   | Eliminates 128MB read for n=22  |
 | 17  | Contiguous Merkle buffer pool      | 20+ allocs → 1 per Merkle tree |
 | 18  | Zero-copy Merkle digest layers     | Eliminates ~256MB memcpy        |
+| 19  | GPU transpose+pad in fused pipeline| CPU scatter-write → GPU kernel  |
 
 
 ---
@@ -1361,3 +1362,116 @@ noise), confirming the optimization is correct with no regressions.
 | 6    | **1.65x** | **1.81x** | **3.48x** |
 | 8    | —         | —         | —         |
 
+
+---
+
+## Optimization 19 — GPU Transpose+Pad in Fused Pipeline
+
+### What it does
+
+Replaces the CPU-side transpose and zero-fill in `gpu_transpose_dft_and_merkle` with
+the existing `bb_transpose_pad` Metal kernel, dispatched in the same command buffer as
+DFT and Merkle operations.
+
+### Before
+
+```
+CPU: zero-fill output buffer (out_height × out_width)
+CPU: scattered transpose writes (rayon par_chunks_mut)
+     ↓ data already in Metal buffer (unified memory)
+GPU: DFT → Merkle
+```
+
+The CPU transpose involved:
+1. `dst_slice.fill(BabyBear::ZERO)` — zeroing the entire output buffer
+2. Nested loop with scattered writes: for each output row, gather from non-contiguous
+   source positions across `in_rows × in_cols × elem_size` elements
+
+For n=24, this meant zeroing and writing into a ~64MB buffer with poor cache locality.
+
+### After
+
+```
+CPU: upload source data into Metal buffer (just input size)
+GPU: bb_transpose_pad → DFT → Merkle  (single command buffer)
+```
+
+The GPU kernel handles both the transpose and the zero-padding in one pass with
+massive parallelism. The source buffer is only `data.len()` elements (no zero-fill
+needed), and the entire transpose+pad+DFT+Merkle pipeline runs without CPU
+synchronization points.
+
+### Why it helps
+
+- **Eliminates CPU scattered writes**: The transpose pattern has poor cache locality
+  (strided access across `elem_size` granularity). The GPU handles this natively.
+- **Eliminates CPU zero-fill**: No need to zero the output buffer; the GPU kernel
+  writes zeros for padded rows directly.
+- **Smaller upload**: Only the source data is uploaded (`in_rows × in_cols × elem_size`),
+  not the full padded output.
+- **Better pipeline fusion**: Transpose, DFT, and Merkle all execute in one command
+  buffer with no CPU synchronization between stages.
+
+### GPU/CPU speedup after Optimization 19
+
+#### n=18 (2^18 = 256K coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.11x** | **1.49x** | **1.71x** |
+| 2    | **1.05x** | **1.38x** | **1.69x** |
+| 3    | 0.64x     | **1.20x** | **1.73x** |
+| 4    | 0.82x     | **1.18x** | **1.32x** |
+| 6    | 0.67x     | **1.21x** | **1.32x** |
+| 8    | 0.47x     | 0.82x     | 0.87x     |
+
+
+#### n=20 (2^20 = 1M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.59x** | **1.90x** | **1.80x** |
+| 2    | **1.46x** | **1.87x** | **2.04x** |
+| 3    | **1.44x** | **1.53x** | **1.71x** |
+| 4    | **1.10x** | **1.56x** | **1.43x** |
+| 6    | **1.08x** | **1.61x** | **1.49x** |
+| 8    | 0.79x     | **1.28x** | **1.51x** |
+
+
+#### n=22 (2^22 = 4M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **2.00x** | **1.84x** | **1.85x** |
+| 2    | **1.74x** | **1.94x** | **2.01x** |
+| 3    | **1.54x** | **1.71x** | **1.98x** |
+| 4    | **1.61x** | **1.73x** | **1.65x** |
+| 6    | **1.49x** | **1.46x** | **2.15x** |
+| 8    | **1.41x** | **1.48x** | **1.88x** |
+
+
+#### n=24 (2^24 = 16M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.74x** | **2.12x** | **1.39x** |
+| 2    | **1.74x** | **2.09x** | **1.98x** |
+| 3    | **1.96x** | **1.80x** | **2.11x** |
+| 4    | **1.38x** | **1.82x** | **3.95x** |
+| 6    | **1.39x** | **1.81x** | **3.18x** |
+| 8    | —         | —         | —         |
+
+### Impact
+
+The optimization primarily benefits the `gpu_transpose_dft_and_merkle` code path,
+which is used when the prover needs to transpose and pad matrices before DFT (common
+in rounds with folding). The speedup numbers are stable compared to Opt 18, which is
+expected: on Apple Silicon's unified memory architecture, the CPU transpose with rayon
+parallelism was already reasonably fast since both CPU and GPU access the same physical
+memory. The GPU kernel eliminates the zero-fill overhead and improves pipeline fusion,
+but the transpose itself was not the dominant bottleneck. The structural improvement
+ensures no CPU synchronization between transpose and DFT stages.
