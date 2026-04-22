@@ -1,0 +1,33 @@
+=== GPU vs CPU Benchmark Sweep ===
+n=18 f=3 r=1 cpu=0.0178s gpu=0.0207s speedup=.85x
+n=18 f=3 r=2 cpu=0.0362s gpu=0.0251s speedup=1.44x
+n=18 f=4 r=1 cpu=0.0170s gpu=0.0176s speedup=.96x
+n=18 f=4 r=2 cpu=0.0224s gpu=0.0223s speedup=1.00x
+n=18 f=6 r=1 cpu=0.0107s gpu=0.0159s speedup=.67x
+n=18 f=6 r=2 cpu=0.0149s gpu=0.0183s speedup=.81x
+n=18 f=8 r=1 cpu=0.0106s gpu=0.0205s speedup=.51x
+n=18 f=8 r=2 cpu=0.0153s gpu=0.0239s speedup=.64x
+n=20 f=3 r=1 cpu=0.0600s gpu=0.0463s speedup=1.29x
+n=20 f=3 r=2 cpu=0.1035s gpu=0.0629s speedup=1.64x
+n=20 f=4 r=1 cpu=0.0437s gpu=0.0389s speedup=1.12x
+n=20 f=4 r=2 cpu=0.0909s gpu=0.0588s speedup=1.54x
+n=20 f=6 r=1 cpu=0.0380s gpu=0.0374s speedup=1.01x
+n=20 f=6 r=2 cpu=0.1021s gpu=0.0818s speedup=1.24x
+n=20 f=8 r=1 cpu=0.0269s gpu=0.0293s speedup=.91x
+n=20 f=8 r=2 cpu=0.0490s gpu=0.0407s speedup=1.20x
+n=22 f=3 r=1 cpu=0.2198s gpu=0.1403s speedup=1.56x
+n=22 f=3 r=2 cpu=0.4198s gpu=0.2391s speedup=1.75x
+n=22 f=4 r=1 cpu=0.1687s gpu=0.1061s speedup=1.59x
+n=22 f=4 r=2 cpu=0.2982s gpu=0.1955s speedup=1.52x
+n=22 f=6 r=1 cpu=0.1411s gpu=0.0978s speedup=1.44x
+n=22 f=6 r=2 cpu=0.5887s gpu=0.5302s speedup=1.11x
+n=22 f=8 r=1 cpu=0.1009s gpu=0.0649s speedup=1.55x
+n=22 f=8 r=2 cpu=0.1768s gpu=0.1294s speedup=1.36x
+n=24 f=3 r=1 cpu=0.8809s gpu=0.5284s speedup=1.66x
+n=24 f=3 r=2 cpu=1.5922s gpu=0.9205s speedup=1.72x
+n=24 f=4 r=1 cpu=1.1418s gpu=0.7453s speedup=1.53x
+n=24 f=4 r=2 cpu=4.2952s gpu=2.4204s speedup=1.77x
+n=24 f=6 r=1 cpu=0.5970s gpu=0.4348s speedup=1.37x
+n=24 f=6 r=2 cpu=1.5391s gpu=1.2744s speedup=1.20x
+n=24 f=8 r=1 cpu=27.57s gpu=34.90s speedup=0.79x
+n=24 f=8 r=2 (skipped: takes >5min per run)

@@ -1577,3 +1577,89 @@ in the fused prover. Key improvements:
 
 The zero-copy extension field data eliminates one unnecessary allocation and copy per
 algebra round, providing a small but consistent improvement across all configurations.
+
+---
+
+## Optimization 21 — XL Shared-memory DIF Kernel + Contiguity Bugfix
+
+### Purpose
+
+Two changes:
+
+1. **Fix a segfault in `GpuMmcs::commit`**: The contiguity check compared pointers
+   from `FlatMatrixView::row_slice()`, which allocates a *new* `Vec` per call. Two
+   independent heap allocations could accidentally appear adjacent, causing the check
+   to pass and `from_raw_parts(ptr, height*width)` to read far past the allocation.
+   The fix verifies pointer stability (same pointer from two calls to `row_slice(0)`)
+   before trusting the adjacency check.
+
+2. **XL shared-memory DIF kernel** (`bb_dif_shared_bitrev_xl`): Handles blocks of up
+   to 8192 elements (`log_block=13`) using 8 elements/thread and 32KB threadgroup
+   memory. This extends the shared-memory DIF tail from `log_block≤12` to `log_block≤13`,
+   eliminating one additional global memory pass for DFTs with 13+ stages.
+
+### Before → After
+
+| Aspect | Before (Opt 20) | After (Opt 21) |
+|--------|-----------------|----------------|
+| `max_log_shared_block` | 12 (4096 elements) | 13 (8192 elements) |
+| Shared memory per block | 16 KB | 32 KB |
+| Elements per thread | 4 | 8 |
+| `GpuMmcs::commit` contiguity | Unsafe for `FlatMatrixView` | Safe (pointer stability check) |
+
+### Why it helps
+
+For DFTs with `log_n ≥ 13`, the entire NTT now fits in shared memory in one pass
+(or the shared-memory tail covers 13 stages instead of 12). This reduces global
+memory traffic and eliminates one DIF pass for affected sizes.
+
+### Benchmark results (Apple M3 Max)
+
+#### GPU / CPU speedup table
+
+##### n=18
+
+| fold | rate=1 | rate=2 |
+|------|--------|--------|
+| 3    | 0.85x  | 1.44x  |
+| 4    | 0.96x  | 1.00x  |
+| 6    | 0.67x  | 0.81x  |
+| 8    | 0.51x  | 0.64x  |
+
+##### n=20
+
+| fold | rate=1    | rate=2    |
+|------|-----------|-----------|
+| 3    | **1.29x** | **1.64x** |
+| 4    | **1.12x** | **1.54x** |
+| 6    | **1.01x** | **1.24x** |
+| 8    | 0.91x     | **1.20x** |
+
+##### n=22
+
+| fold | rate=1    | rate=2    |
+|------|-----------|-----------|
+| 3    | **1.56x** | **1.75x** |
+| 4    | **1.59x** | **1.52x** |
+| 6    | **1.44x** | **1.11x** |
+| 8    | **1.55x** | **1.36x** |
+
+##### n=24
+
+| fold | rate=1    | rate=2    |
+|------|-----------|-----------|
+| 3    | **1.66x** | **1.72x** |
+| 4    | **1.53x** | **1.77x** |
+| 6    | **1.37x** | **1.20x** |
+| 8    | 0.79x     | —         |
+
+### Impact
+
+The contiguity bugfix eliminates a latent segfault that affected configurations
+where `GpuMmcs::commit` received a `FlatMatrixView` matrix (most notably `n=22,
+fold=8`). This was a heap-dependent crash that could also corrupt GPU results
+silently.
+
+The XL kernel provides modest improvement for DFTs with `log_n ∈ [13, 14]` where
+the shared-memory tail now covers one more stage. The primary GPU speedup (1.5–1.8x
+for n≥22) comes from the cumulative effect of all optimizations.

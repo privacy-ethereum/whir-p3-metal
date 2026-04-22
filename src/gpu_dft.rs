@@ -273,6 +273,7 @@ pub struct MetalInner {
     dif_r2_bitrev_ps: ComputePipelineState,
     dif_shared_bitrev_ps: ComputePipelineState,
     dif_shared_bitrev_lg_ps: ComputePipelineState,
+    dif_shared_bitrev_xl_ps: ComputePipelineState,
     max_log_shared_block: u32,
     max_log_stockham_block: u32,
     twiddle_bufs: Mutex<HashMap<u32, Buffer>>,
@@ -443,6 +444,7 @@ impl MetalBabyBearDft {
         let dif_r2_bitrev_ps = make_ps("bb_dif_r2_bitrev");
         let dif_shared_bitrev_ps = make_ps("bb_dif_shared_bitrev");
         let dif_shared_bitrev_lg_ps = make_ps("bb_dif_shared_bitrev_lg");
+        let dif_shared_bitrev_xl_ps = make_ps("bb_dif_shared_bitrev_xl");
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_hash_and_compress_ps = make_ps("poseidon2_hash_and_compress");
         let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
@@ -473,11 +475,16 @@ impl MetalBabyBearDft {
         );
 
         let max_tg = shared_mem_ps.max_total_threads_per_threadgroup() as u32;
-        let max_log_shared_block = max_tg.min(1024).ilog2() + 2;
+        let xl_max_tg = dif_shared_bitrev_xl_ps.max_total_threads_per_threadgroup() as u32;
+        let max_log_shared_block = if xl_max_tg >= 1024 {
+            13
+        } else {
+            max_tg.min(1024).ilog2() + 2
+        };
         let max_stockham_tg = stockham_ps.max_total_threads_per_threadgroup() as u32;
         let max_log_stockham_block = max_stockham_tg.min(1024).ilog2() + 2;
 
-        eprintln!("[Metal] max_tg={max_tg} max_log_shared={max_log_shared_block} stockham_tg={max_stockham_tg} max_log_stockham={max_log_stockham_block}");
+        eprintln!("[Metal] max_tg={max_tg} xl_max_tg={xl_max_tg} max_log_shared={max_log_shared_block} stockham_tg={max_stockham_tg} max_log_stockham={max_log_stockham_block}");
 
         Self { inner: Arc::new(MetalInner {
             cpu,
@@ -508,6 +515,7 @@ impl MetalBabyBearDft {
             dif_r2_bitrev_ps,
             dif_shared_bitrev_ps,
             dif_shared_bitrev_lg_ps,
+            dif_shared_bitrev_xl_ps,
             max_log_shared_block,
             max_log_stockham_block,
             twiddle_bufs: Mutex::new(HashMap::new()),
@@ -1402,9 +1410,9 @@ impl MetalBabyBearDft {
         let block_size = 1u32 << log_block;
         let num_blocks = height >> log_block;
 
-        // Use the large kernel (4 elems/thread) for log_block > 10, otherwise
-        // the small kernel (2 elems/thread). Both have the same buffer layout.
-        let (ps, threads_per_tg) = if log_block > 10 {
+        let (ps, threads_per_tg) = if log_block > 12 {
+            (&self.dif_shared_bitrev_xl_ps, block_size >> 3)
+        } else if log_block > 10 {
             (&self.dif_shared_bitrev_lg_ps, block_size >> 2)
         } else {
             (&self.dif_shared_bitrev_ps, block_size >> 1)
@@ -1548,7 +1556,6 @@ impl MetalBabyBearDft {
                 let cmd = self.queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 if use_four_step {
-                    // Four-step: zc → temp → zc (natural order)
                     self.encode_four_step_ntt_oop(&enc, &zc_buf, &zc_buf, &data_buf, &tw,
                         log_n, height as u32, width as u32);
                 } else {
@@ -2422,11 +2429,15 @@ where
             let total_bytes = height * width * size_of::<u32>();
             if total_bytes >= 128 * 1024 {
                 let is_contiguous = height >= 2 && {
-                    let s0 = inputs[0].row_slice(0).unwrap();
-                    let s1 = inputs[0].row_slice(1).unwrap();
-                    let p0 = (*s0).as_ptr();
-                    let p1 = (*s1).as_ptr();
-                    unsafe { p0.add(width) == p1 }
+                    let s0a = inputs[0].row_slice(0).unwrap();
+                    let s0b = inputs[0].row_slice(0).unwrap();
+                    let borrowed = (*s0a).as_ptr() == (*s0b).as_ptr();
+                    if borrowed {
+                        let s1 = inputs[0].row_slice(1).unwrap();
+                        unsafe { (*s0a).as_ptr().add(width) == (*s1).as_ptr() }
+                    } else {
+                        false
+                    }
                 };
 
                 let result = if is_contiguous {

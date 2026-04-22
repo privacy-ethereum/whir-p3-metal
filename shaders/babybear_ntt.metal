@@ -2018,6 +2018,73 @@ kernel void bb_dif_shared_bitrev_lg(
     }
 }
 
+kernel void bb_dif_shared_bitrev_xl(
+    device const Bb* src       [[buffer(0)]],
+    device Bb* dst             [[buffer(1)]],
+    device const Bb* twiddles  [[buffer(2)]],
+    constant uint& height      [[buffer(3)]],
+    constant uint& width       [[buffer(4)]],
+    constant uint& start_stage [[buffer(5)]],
+    constant uint& log_n       [[buffer(6)]],
+    constant uint& log_block   [[buffer(7)]],
+    uint2 gpos                 [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_index_in_threadgroup]]
+) {
+    uint col = gpos.x;
+    uint block_idx = gpos.y;
+    if (col >= width) return;
+
+    uint block_size = 1u << log_block;
+    uint eighth     = block_size >> 3;
+    uint global_base = block_idx << log_block;
+
+    threadgroup Bb sdata[8192];
+
+    for (uint j = 0; j < 8; j++) {
+        uint elem = lid + j * eighth;
+        sdata[elem] = src[(global_base + elem) * width + col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ls = 0; ls < log_block; ls++) {
+        uint s = start_stage + ls;
+        uint log_stride = (log_block - 1) - ls;
+        uint local_stride = 1u << log_stride;
+
+        for (uint b = 0; b < 4; b++) {
+            uint butterfly = lid + b * eighth;
+            uint grp = butterfly >> log_stride;
+            uint k   = butterfly & (local_stride - 1);
+            uint idx_a = (grp << (log_stride + 1)) + k;
+            uint idx_b = idx_a + local_stride;
+
+            Bb a = sdata[idx_a];
+            Bb bv = sdata[idx_b];
+            Bb sum  = bb_add(a, bv);
+            Bb diff = bb_sub(a, bv);
+
+            uint tw_idx = k << s;
+            sdata[idx_a] = sum;
+            sdata[idx_b] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+        }
+
+        if (ls + 1 < log_block) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint log_upper = log_n - log_block;
+    uint num_blocks = height >> log_block;
+    uint rev_block = bit_reverse_n(block_idx, log_upper);
+
+    for (uint j = 0; j < 8; j++) {
+        uint local_i = lid + j * eighth;
+        uint rev_i   = bit_reverse_n(local_i, log_block);
+        uint dst_row = rev_i * num_blocks + rev_block;
+        dst[dst_row * width + col] = sdata[local_i];
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Poseidon2 BabyBear width-16 permutation + Merkle hashing kernels
 // ═══════════════════════════════════════════════════════════════════════
