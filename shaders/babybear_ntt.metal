@@ -57,6 +57,14 @@ kernel void bb_bandwidth_test(
     data[gid] = data[gid] + 1u;
 }
 
+kernel void bb_buf_copy(
+    device const uint* src [[buffer(0)]],
+    device uint* dst       [[buffer(1)]],
+    uint gid               [[thread_position_in_grid]]
+) {
+    dst[gid] = src[gid];
+}
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -1939,6 +1947,77 @@ kernel void bb_dif_shared_bitrev(
     }
 }
 
+// Large shared-memory DIF + bit-reversal (4 elements per thread).
+// Handles up to 4096 elements (log_block ≤ 12) with 1024 threads.
+// Same interface as bb_dif_shared_bitrev but 4× larger blocks.
+kernel void bb_dif_shared_bitrev_lg(
+    device const Bb* src       [[buffer(0)]],
+    device Bb* dst             [[buffer(1)]],
+    device const Bb* twiddles  [[buffer(2)]],
+    constant uint& height      [[buffer(3)]],
+    constant uint& width       [[buffer(4)]],
+    constant uint& start_stage [[buffer(5)]],
+    constant uint& log_n       [[buffer(6)]],
+    constant uint& log_block   [[buffer(7)]],
+    uint2 gpos                 [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_index_in_threadgroup]]
+) {
+    uint col = gpos.x;
+    uint block_idx = gpos.y;
+    if (col >= width) return;
+
+    uint block_size = 1u << log_block;
+    uint quarter    = block_size >> 2;
+    uint half_block = block_size >> 1;
+    uint global_base = block_idx << log_block;
+
+    threadgroup Bb sdata[4096];
+
+    for (uint j = 0; j < 4; j++) {
+        uint elem = lid + j * quarter;
+        sdata[elem] = src[(global_base + elem) * width + col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ls = 0; ls < log_block; ls++) {
+        uint s = start_stage + ls;
+        uint log_stride = (log_block - 1) - ls;
+        uint local_stride = 1u << log_stride;
+
+        for (uint b = 0; b < 2; b++) {
+            uint butterfly = lid + b * quarter;
+            uint grp = butterfly >> log_stride;
+            uint k   = butterfly & (local_stride - 1);
+            uint idx_a = (grp << (log_stride + 1)) + k;
+            uint idx_b = idx_a + local_stride;
+
+            Bb a = sdata[idx_a];
+            Bb bv = sdata[idx_b];
+            Bb sum  = bb_add(a, bv);
+            Bb diff = bb_sub(a, bv);
+
+            uint tw_idx = k << s;
+            sdata[idx_a] = sum;
+            sdata[idx_b] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+        }
+
+        if (ls + 1 < log_block) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint log_upper = log_n - log_block;
+    uint num_blocks = height >> log_block;
+    uint rev_block = bit_reverse_n(block_idx, log_upper);
+
+    for (uint j = 0; j < 4; j++) {
+        uint local_i = lid + j * quarter;
+        uint rev_i   = bit_reverse_n(local_i, log_block);
+        uint dst_row = rev_i * num_blocks + rev_block;
+        dst[dst_row * width + col] = sdata[local_i];
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Poseidon2 BabyBear width-16 permutation + Merkle hashing kernels
 // ═══════════════════════════════════════════════════════════════════════
@@ -2144,6 +2223,68 @@ kernel void poseidon2_merkle_compress(
     for (uint i = 0; i < 8; i++) state[i]     = children[left_start + i];
     for (uint i = 0; i < 8; i++) state[8 + i]  = children[right_start + i];
 
+    poseidon2_permute_16(state, rc);
+
+    uint out_start = gid * 8;
+    for (uint i = 0; i < 8; i++) parents[out_start + i] = state[i];
+}
+
+// ── Fused leaf hash + first compress ──────────────────────────────────
+// Each thread hashes two adjacent leaves, writes both leaf digests
+// to the leaf buffer (needed for query answering), AND compresses
+// the pair directly, writing the parent to the compress buffer.
+// Eliminates the global-memory read of the leaf buffer for the first
+// compression level.
+// Thread gid handles leaves 2*gid and 2*gid+1.
+kernel void poseidon2_hash_and_compress(
+    device const Bb* data        [[buffer(0)]],
+    device Bb* leaf_digests      [[buffer(1)]],
+    device Bb* parents           [[buffer(2)]],
+    constant Bb* rc              [[buffer(3)]],
+    constant uint& num_pairs     [[buffer(4)]],
+    constant uint& leaf_width    [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= num_pairs) return;
+
+    // Hash left leaf (2*gid)
+    Bb left[16] = {};
+    uint left_start = (2 * gid) * leaf_width;
+    for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+        uint remaining = min(8u, leaf_width - absorbed);
+        for (uint i = 0; i < remaining; i++) {
+            left[i] = data[left_start + absorbed + i];
+        }
+        if (remaining < 8) {
+            for (uint i = remaining; i < 8; i++) left[i] = Bb{0};
+        }
+        poseidon2_permute_16(left, rc);
+    }
+    // Write left leaf digest
+    uint left_out = (2 * gid) * 8;
+    for (uint i = 0; i < 8; i++) leaf_digests[left_out + i] = left[i];
+
+    // Hash right leaf (2*gid + 1)
+    Bb right[16] = {};
+    uint right_start = (2 * gid + 1) * leaf_width;
+    for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+        uint remaining = min(8u, leaf_width - absorbed);
+        for (uint i = 0; i < remaining; i++) {
+            right[i] = data[right_start + absorbed + i];
+        }
+        if (remaining < 8) {
+            for (uint i = remaining; i < 8; i++) right[i] = Bb{0};
+        }
+        poseidon2_permute_16(right, rc);
+    }
+    // Write right leaf digest
+    uint right_out = (2 * gid + 1) * 8;
+    for (uint i = 0; i < 8; i++) leaf_digests[right_out + i] = right[i];
+
+    // Compress: state = [left_digest || right_digest], permute, truncate
+    Bb state[16];
+    for (uint i = 0; i < 8; i++) state[i]     = left[i];
+    for (uint i = 0; i < 8; i++) state[8 + i]  = right[i];
     poseidon2_permute_16(state, rc);
 
     uint out_start = gid * 8;

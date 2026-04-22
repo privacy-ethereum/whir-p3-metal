@@ -544,7 +544,6 @@ where
         }
 
         challenger.sample();
-
         let stir_challenges_indexes = get_challenge_stir_queries::<Challenger, F, EF>(
             round_params.domain_size,
             self.folding_factor.at_round(round_index),
@@ -598,7 +597,6 @@ where
                 }
             }
         }
-
         proof.rounds[round_index].queries = queries;
 
         let constraint = Constraint::new(
