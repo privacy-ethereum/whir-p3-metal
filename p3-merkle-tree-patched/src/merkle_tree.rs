@@ -54,11 +54,22 @@ pub struct MerkleTree<F, W, M, const N: usize, const DIGEST_ELEMS: usize> {
     #[serde(skip, default)]
     gpu_backed_layers: usize,
 
+    /// When true, the leaf matrices' backing memory is owned externally
+    /// (e.g. a GPU Metal buffer). The custom `Drop` forgets the leaf data
+    /// using `_leaf_forget_fn` before the keepalive handle is dropped.
+    #[serde(skip, default)]
+    gpu_backed_leaves: bool,
+
     /// Opaque handle that keeps the external memory alive while the tree
     /// exists.  Dropped *after* the custom `Drop` forgets the GPU-backed
     /// layers, so the memory is valid for the entire tree lifetime.
     #[serde(skip, default)]
     _keepalive: Option<Box<dyn Any + Send + Sync>>,
+
+    /// Optional callback to forget GPU-backed leaf data before the keepalive
+    /// is dropped. Takes a mutable reference to the leaves Vec.
+    #[serde(skip, default)]
+    _leaf_forget_fn: Option<Box<dyn FnOnce(&mut Vec<M>) + Send + Sync>>,
 }
 
 impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> core::fmt::Debug
@@ -74,6 +85,7 @@ where
             .field("digest_layers", &self.digest_layers)
             .field("arity_schedule", &self.arity_schedule)
             .field("gpu_backed_layers", &self.gpu_backed_layers)
+            .field("gpu_backed_leaves", &self.gpu_backed_leaves)
             .finish()
     }
 }
@@ -85,6 +97,9 @@ impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> Drop
         for i in 0..self.gpu_backed_layers {
             let layer = core::mem::replace(&mut self.digest_layers[i], Vec::new());
             core::mem::forget(layer);
+        }
+        if let Some(forget_fn) = self._leaf_forget_fn.take() {
+            forget_fn(&mut self.leaves);
         }
     }
 }
@@ -102,7 +117,9 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
             leaves, digest_layers, arity_schedule,
             _phantom: PhantomData,
             gpu_backed_layers: 0,
+            gpu_backed_leaves: false,
             _keepalive: None,
+            _leaf_forget_fn: None,
         }
     }
 
@@ -130,7 +147,30 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
             leaves, digest_layers, arity_schedule,
             _phantom: PhantomData,
             gpu_backed_layers,
+            gpu_backed_leaves: false,
             _keepalive: Some(keepalive),
+            _leaf_forget_fn: None,
+        }
+    }
+
+    /// Like `from_parts_gpu_backed`, but also marks the leaf matrices' inner
+    /// data as externally owned. The provided `leaf_forget_fn` is called
+    /// during Drop to prevent the leaf data from being deallocated.
+    pub unsafe fn from_parts_gpu_backed_with_leaves(
+        leaves: Vec<M>,
+        digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
+        arity_schedule: Vec<usize>,
+        gpu_backed_layers: usize,
+        keepalive: Box<dyn Any + Send + Sync>,
+        leaf_forget_fn: Box<dyn FnOnce(&mut Vec<M>) + Send + Sync>,
+    ) -> Self {
+        Self {
+            leaves, digest_layers, arity_schedule,
+            _phantom: PhantomData,
+            gpu_backed_layers,
+            gpu_backed_leaves: true,
+            _keepalive: Some(keepalive),
+            _leaf_forget_fn: Some(leaf_forget_fn),
         }
     }
 
@@ -237,7 +277,9 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
             arity_schedule,
             _phantom: PhantomData,
             gpu_backed_layers: 0,
+            gpu_backed_leaves: false,
             _keepalive: None,
+            _leaf_forget_fn: None,
         }
     }
 

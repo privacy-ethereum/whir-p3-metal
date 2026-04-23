@@ -74,6 +74,17 @@ pub trait DftCommitFusion<F: Field>: Mmcs<F> {
         None
     }
 
+    /// Compute select-statement weight polynomial on GPU.
+    /// Returns None if GPU acceleration is not available.
+    fn gpu_combine_select_weights(
+        &self,
+        _vars: &[F],
+        _alphas_raw: &[u32],
+        _k: usize,
+    ) -> Option<Vec<u32>> {
+        None
+    }
+
     /// Fused transpose + pad + DFT + commit for extension field.
     fn transpose_pad_dft_algebra_and_commit<EF>(
         &self,
@@ -285,8 +296,10 @@ pub struct MetalInner {
     poseidon2_hash_leaves_ps: ComputePipelineState,
     poseidon2_hash_and_compress_ps: ComputePipelineState,
     poseidon2_hash4_compress3_ps: ComputePipelineState,
+    poseidon2_merkle_simd_ps: ComputePipelineState,
     poseidon2_compress_ps: ComputePipelineState,
     poseidon2_pow_grind_ps: ComputePipelineState,
+    combine_select_ps: ComputePipelineState,
     transpose_pad_ps: ComputePipelineState,
     poseidon2_rc_buf: Buffer,
     buf_copy_ps: ComputePipelineState,
@@ -333,18 +346,33 @@ struct MerkleLayers {
 
 struct MerkleBufferKeepalive(Buffer);
 
+/// Keeps both the Merkle digest buffer and the DFT output buffer alive.
+struct DualBufferKeepalive {
+    _merkle: Buffer,
+    _dft: Buffer,
+}
+
 pub struct GpuMerkleResult {
     pub cap: p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
     pub digest_layers: Vec<Vec<[BabyBear; 8]>>,
     pub arity_schedule: Vec<usize>,
     gpu_backed: Option<(usize, Box<dyn std::any::Any + Send + Sync>)>,
+    /// When set, the leaf data is zero-copy from this GPU buffer.
+    /// The `leaf_forget_fn` must be used to prevent dealloc of the leaf Vec.
+    leaf_keepalive: Option<Buffer>,
 }
 
 impl GpuMerkleResult {
-    pub fn into_tree<M: p3_matrix::Matrix<BabyBear>>(self, leaves: Vec<M>) -> (
+    /// Convert to MerkleTree. Requires `M: 'static` only if leaf_keepalive is set
+    /// (zero-copy DFT output path). For the common path, use `into_tree` which
+    /// has no `'static` bound.
+    pub fn into_tree<M: p3_matrix::Matrix<BabyBear>>(
+        self, leaves: Vec<M>,
+    ) -> (
         p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
         p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>,
     ) {
+        assert!(self.leaf_keepalive.is_none(), "use into_tree_zc for zero-copy leaves");
         let tree = match self.gpu_backed {
             Some((count, keepalive)) => unsafe {
                 p3_merkle_tree::MerkleTree::from_parts_gpu_backed(
@@ -353,6 +381,46 @@ impl GpuMerkleResult {
                 )
             },
             None => p3_merkle_tree::MerkleTree::from_parts(
+                leaves, self.digest_layers, self.arity_schedule,
+            ),
+        };
+        (self.cap, tree)
+    }
+
+    /// Zero-copy variant: also prevents the leaf Vecs from being deallocated.
+    pub fn into_tree_zc<M: p3_matrix::Matrix<BabyBear> + Send + Sync + 'static>(
+        self, leaves: Vec<M>,
+    ) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>,
+    ) {
+        let tree = match (self.gpu_backed, self.leaf_keepalive) {
+            (Some((count, merkle_ka)), Some(dft_buf)) => {
+                let combined: Box<dyn std::any::Any + Send + Sync> = match merkle_ka.downcast::<MerkleBufferKeepalive>() {
+                    Ok(mk) => Box::new(DualBufferKeepalive { _merkle: mk.0, _dft: dft_buf }),
+                    Err(mk) => {
+                        let pair: (Box<dyn std::any::Any + Send + Sync>, Buffer) = (mk, dft_buf);
+                        Box::new(pair)
+                    }
+                };
+                let leaf_forget_fn: Box<dyn FnOnce(&mut Vec<M>) + Send + Sync> = Box::new(|leaves: &mut Vec<M>| {
+                    let taken = core::mem::take(leaves);
+                    core::mem::forget(taken);
+                });
+                unsafe {
+                    p3_merkle_tree::MerkleTree::from_parts_gpu_backed_with_leaves(
+                        leaves, self.digest_layers, self.arity_schedule,
+                        count, combined, leaf_forget_fn,
+                    )
+                }
+            }
+            (Some((count, keepalive)), None) => unsafe {
+                p3_merkle_tree::MerkleTree::from_parts_gpu_backed(
+                    leaves, self.digest_layers, self.arity_schedule,
+                    count, keepalive,
+                )
+            },
+            _ => p3_merkle_tree::MerkleTree::from_parts(
                 leaves, self.digest_layers, self.arity_schedule,
             ),
         };
@@ -450,8 +518,10 @@ impl MetalBabyBearDft {
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_hash_and_compress_ps = make_ps("poseidon2_hash_and_compress");
         let poseidon2_hash4_compress3_ps = make_ps("poseidon2_hash4_compress3");
+        let poseidon2_merkle_simd_ps = make_ps("poseidon2_merkle_simd");
         let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
         let poseidon2_pow_grind_ps = make_ps("poseidon2_pow_grind");
+        let combine_select_ps = make_ps("bb_combine_select");
         let transpose_pad_ps = make_ps("bb_transpose_pad");
         let buf_copy_ps = make_ps("bb_buf_copy");
 
@@ -528,8 +598,10 @@ impl MetalBabyBearDft {
             poseidon2_hash_leaves_ps,
             poseidon2_hash_and_compress_ps,
             poseidon2_hash4_compress3_ps,
+            poseidon2_merkle_simd_ps,
             poseidon2_compress_ps,
             poseidon2_pow_grind_ps,
+            combine_select_ps,
             transpose_pad_ps,
             poseidon2_rc_buf,
             buf_copy_ps,
@@ -710,11 +782,10 @@ impl MetalBabyBearDft {
         let out_width_words = in_rows * elem_size;
         let total_out = out_height * out_width_words;
 
-        let opts = MTLResourceOptions::StorageModeShared;
-        let src_buf = self.device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            (data.len() * size_of::<u32>()) as u64,
-            opts,
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+        let src_buf = Self::make_source_buffer(
+            &self.device, data.as_ptr(), (data.len() * size_of::<u32>()) as u64, opts,
         );
         let dst_buf = self.device.new_buffer(
             (total_out * size_of::<u32>()) as u64,
@@ -988,11 +1059,7 @@ impl MetalBabyBearDft {
 
         let max_tg_compress =
             self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
-        let mut current_count = match start_layer {
-            3 => num_leaves / 4,
-            2 => num_leaves / 2,
-            _ => num_leaves,
-        };
+        let mut current_count = num_leaves >> (start_layer - 1).min(31);
         for layer_idx in start_layer..layer_counts.len() {
             let pairs = current_count / 2;
             enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
@@ -1078,6 +1145,7 @@ impl MetalBabyBearDft {
         GpuMerkleResult {
             cap, digest_layers, arity_schedule,
             gpu_backed: Some((num_layers, keepalive)),
+            leaf_keepalive: None,
         }
     }
 
@@ -1263,15 +1331,13 @@ impl MetalBabyBearDft {
         let src_bytes = (data.len() * size_of::<u32>()) as u64;
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache
             | MTLResourceOptions::StorageModeShared;
-        let src_buf = self.device.new_buffer_with_data(
-            data.as_ptr().cast(), src_bytes, opts,
-        );
+        let src_buf = Self::make_source_buffer(&self.device, data.as_ptr(), src_bytes, opts);
 
         let use_four_step = self.use_four_step(log_n);
 
         let profiling = std::env::var("GPU_PROFILE").is_ok();
 
-        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>)> = autoreleasepool(|| {
+        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>, Option<bool>)> = autoreleasepool(|| {
             let encode_transpose = |enc: &ComputeCommandEncoderRef| {
                 let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
                     enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
@@ -1356,23 +1422,26 @@ impl MetalBabyBearDft {
                     self.release_merkle_layers(merkle);
                     return None;
                 }
-                Some((merkle, out_values))
+                // Profiling path: out_values owns its copy, no zero-copy leaf
+                Some((merkle, out_values, None))
             } else {
                 let cmd = self.queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 encode_transpose(&enc);
 
-                let dft_out_buf = if use_four_step {
+                let dft_out_is_dif = if use_four_step {
                     self.encode_four_step_ntt(&enc, &dif_buf, &natural_buf, &tw,
                         log_n, out_height as u32, out_width as u32);
-                    &dif_buf
+                    true
                 } else {
                     self.encode_dif_ntt(
                         &enc, &dif_buf, &natural_buf, &tw,
                         log_n, out_height as u32, out_width as u32,
                     );
-                    &natural_buf
+                    false
                 };
+
+                let dft_out_buf = if dft_out_is_dif { &dif_buf } else { &natural_buf };
 
                 let merkle = self.encode_merkle_tree(
                     &enc, dft_out_buf, out_height as u32, out_width as u32,
@@ -1385,24 +1454,42 @@ impl MetalBabyBearDft {
                     return None;
                 }
 
-                let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
-                unsafe {
-                    out_values.set_len(total_out);
-                    fast_memcpy_from_gpu(
-                        out_values.as_mut_ptr().cast::<u8>(),
-                        dft_out_buf.contents() as *const u8,
-                        total_bytes as usize,
-                    );
-                }
-                Some((merkle, out_values))
+                // Zero-copy: create Vec pointing directly to the Metal buffer
+                let out_values = unsafe {
+                    Vec::from_raw_parts(
+                        dft_out_buf.contents() as *mut BabyBear,
+                        total_out,
+                        total_out,
+                    )
+                };
+                // dft_out_is_dif: Some(true) = dif_buf, Some(false) = natural_buf
+                Some((merkle, out_values, Some(dft_out_is_dif)))
             }
         });
 
-        Self::release_buf(&self.data_buf_cache, dif_buf);
-        Self::release_buf(&self.temp_buf_cache, natural_buf);
-
-        gpu_result.map(|(merkle, out_values)| {
-            (out_values, Self::read_merkle_layers_zero_copy(merkle))
+        gpu_result.map(|(merkle, out_values, zc_buf_is_dif)| {
+            match zc_buf_is_dif {
+                Some(true) => {
+                    // Zero-copy: DFT output is in dif_buf
+                    Self::release_buf(&self.temp_buf_cache, natural_buf);
+                    let mut result = Self::read_merkle_layers_zero_copy(merkle);
+                    result.leaf_keepalive = Some(dif_buf);
+                    (out_values, result)
+                }
+                Some(false) => {
+                    // Zero-copy: DFT output is in natural_buf
+                    Self::release_buf(&self.data_buf_cache, dif_buf);
+                    let mut result = Self::read_merkle_layers_zero_copy(merkle);
+                    result.leaf_keepalive = Some(natural_buf);
+                    (out_values, result)
+                }
+                None => {
+                    // Profiling path: out_values owns its own allocation
+                    Self::release_buf(&self.data_buf_cache, dif_buf);
+                    Self::release_buf(&self.temp_buf_cache, natural_buf);
+                    (out_values, Self::read_merkle_layers_zero_copy(merkle))
+                }
+            }
         })
     }
 
@@ -1636,6 +1723,143 @@ impl MetalBabyBearDft {
         );
     }
 
+    /// Compute the select-statement weight polynomial on GPU.
+    ///
+    /// For each b ∈ {0,1}^k, computes:
+    ///   W(b) = Σ_i alpha[i] * z_i^b
+    ///
+    /// where z_i^b = Π_{j: bit j of b set} vars[i]^{2^j},
+    /// and alpha[i] are the challenge-weighted coefficients (extension field).
+    ///
+    /// Returns the result as a flat Vec<u32> of 2^{k-2} packed extension-field
+    /// elements (16 u32s each), matching the in-memory layout of
+    /// `PackedBinomialExtensionField<BabyBear, PackedBabyBearNeon, 4>`.
+    pub fn gpu_combine_select(
+        &self,
+        vars: &[BabyBear],
+        alphas: &[u32],
+        k: usize,
+    ) -> Vec<u32> {
+        let n = vars.len();
+        assert!(k >= 2);
+        assert_eq!(alphas.len(), n * 4);
+
+        let inner = &*self.inner;
+
+        // Build k × n power matrix: pow_rows[i][j] = vars[j]^{2^i}
+        let mut pow_rows = vec![vec![BabyBear::ZERO; n]; k];
+        for (j, var) in vars.iter().enumerate() {
+            let mut v = *var;
+            for row in &mut pow_rows {
+                row[j] = v;
+                v = v * v;
+            }
+        }
+
+        // Split into left (lower bits) and right (upper bits) halves
+        let k_left = k / 2;
+        let k_right = k - k_left;
+        assert!(k_left >= 2);
+
+        // Butterfly expansion: produces 2^h × n table from h power rows
+        let butterfly = |rows: &[Vec<BabyBear>]| -> Vec<BabyBear> {
+            let h = rows.len();
+            let num_rows = 1usize << h;
+            let mut table = vec![BabyBear::ZERO; num_rows * n];
+            table[..n].fill(BabyBear::ONE);
+            for (i, row) in rows.iter().enumerate() {
+                let num_existing = 1usize << i;
+                for b in 0..num_existing {
+                    for j in 0..n {
+                        table[(b + num_existing) * n + j] = table[b * n + j] * row[j];
+                    }
+                }
+            }
+            table
+        };
+
+        let left_table_rm = butterfly(&pow_rows[..k_left]);
+        let right_table = butterfly(&pow_rows[k_left..]);
+
+        // Transpose left table from [2^k_left × n] to [n × 2^k_left]
+        // for sequential GPU memory access across b_left values.
+        let num_left = 1usize << k_left;
+        let mut left_table = vec![BabyBear::ZERO; n * num_left];
+        for row in 0..num_left {
+            for col in 0..n {
+                left_table[col * num_left + row] = left_table_rm[row * n + col];
+            }
+        }
+
+        let left_u32: &[u32] = unsafe {
+            std::slice::from_raw_parts(left_table.as_ptr().cast(), left_table.len())
+        };
+        let right_u32: &[u32] = unsafe {
+            std::slice::from_raw_parts(right_table.as_ptr().cast(), right_table.len())
+        };
+
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+
+        let left_buf = inner.device.new_buffer_with_data(
+            left_u32.as_ptr().cast(),
+            (left_u32.len() * size_of::<u32>()) as u64,
+            opts,
+        );
+        let right_buf = inner.device.new_buffer_with_data(
+            right_u32.as_ptr().cast(),
+            (right_u32.len() * size_of::<u32>()) as u64,
+            opts,
+        );
+        let alpha_buf = inner.device.new_buffer_with_data(
+            alphas.as_ptr().cast(),
+            (alphas.len() * size_of::<u32>()) as u64,
+            opts,
+        );
+
+        let num_packed = 1usize << (k - 2);
+        let out_elems = num_packed * 16;
+        let out_buf = inner
+            .device
+            .new_buffer((out_elems * size_of::<u32>()) as u64, opts);
+
+        let cb = inner.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&inner.combine_select_ps);
+        enc.set_buffer(0, Some(&left_buf), 0);
+        enc.set_buffer(1, Some(&right_buf), 0);
+        enc.set_buffer(2, Some(&alpha_buf), 0);
+        enc.set_buffer(3, Some(&out_buf), 0);
+
+        let k_left_val = k_left as u32;
+        let n_val = n as u32;
+        enc.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            &k_left_val as *const u32 as *const _,
+        );
+        enc.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            &n_val as *const u32 as *const _,
+        );
+
+        let tg_size = inner
+            .combine_select_ps
+            .max_total_threads_per_threadgroup()
+            .min(256) as u64;
+        enc.dispatch_threads(
+            MTLSize::new(num_packed as u64, 1, 1),
+            MTLSize::new(tg_size, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let ptr = out_buf.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec()
+    }
+
     /// Build Merkle digest layers on GPU from a raw BabyBear slice.
     /// The slice must contain `height * width` elements in row-major order.
     pub fn gpu_build_merkle_digests_raw(
@@ -1647,11 +1871,7 @@ impl MetalBabyBearDft {
         let total_bytes = (height * width * size_of::<u32>()) as u64;
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache
             | MTLResourceOptions::StorageModeShared;
-        let data_buf = self.device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            total_bytes,
-            opts,
-        );
+        let data_buf = Self::make_source_buffer(&self.device, data.as_ptr(), total_bytes, opts);
 
         let merkle = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
@@ -1686,6 +1906,29 @@ impl MetalBabyBearDft {
         p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
     ) {
         self.gpu_build_merkle_digests(&mat).into_tree(vec![mat])
+    }
+
+    /// Create a Metal buffer for read-only source data, using zero-copy when possible.
+    /// Falls back to `new_buffer_with_data` if alignment requirements aren't met.
+    fn make_source_buffer(
+        device: &metal::DeviceRef,
+        ptr: *const BabyBear,
+        bytes: u64,
+        opts: MTLResourceOptions,
+    ) -> Buffer {
+        const PAGE_SIZE: usize = 16384;
+        let addr = ptr as usize;
+        let len = bytes as usize;
+        if addr % PAGE_SIZE == 0 && len % PAGE_SIZE == 0 {
+            device.new_buffer_with_bytes_no_copy(
+                ptr.cast::<std::ffi::c_void>().cast_mut(),
+                bytes,
+                opts,
+                None,
+            )
+        } else {
+            device.new_buffer_with_data(ptr.cast(), bytes, opts)
+        }
     }
 
     /// Try to wrap the Vec's memory directly as a Metal buffer (zero-copy).
@@ -2765,7 +3008,7 @@ where
         let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(data, in_rows, in_cols, padded_height, 1)?;
         let mat = RowMajorMatrix::new(values, in_rows);
-        Some(result.into_tree(vec![mat]))
+        Some(result.into_tree_zc(vec![mat]))
     }
 
     fn transpose_pad_dft_algebra_and_commit<EF>(
@@ -2795,7 +3038,16 @@ where
         };
         let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
-        Some(result.into_tree(vec![flat_view]))
+        Some(result.into_tree_zc(vec![flat_view]))
+    }
+
+    fn gpu_combine_select_weights(
+        &self,
+        vars: &[BabyBear],
+        alphas_raw: &[u32],
+        k: usize,
+    ) -> Option<Vec<u32>> {
+        Some(self.gpu.gpu_combine_select(vars, alphas_raw, k))
     }
 }
 

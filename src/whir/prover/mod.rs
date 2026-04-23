@@ -21,6 +21,7 @@ use crate::{
     },
     fiat_shamir::errors::FiatShamirError,
     parameters::WhirConfig,
+    sumcheck::product_polynomial::ProductPolynomial,
     whir::{
         proof::{QueryOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
@@ -573,7 +574,7 @@ where
                         proof: commitment.opening_proof,
                     });
                 }
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                for (answer, &var) in answers.iter().zip(stir_vars.iter()) {
                     let evals = Poly::new(answer.clone());
                     let eval = evals.eval_base(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
@@ -590,7 +591,7 @@ where
                         proof: commitment.opening_proof,
                     });
                 }
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                for (answer, &var) in answers.iter().zip(stir_vars.iter()) {
                     let evals = Poly::new(answer.clone());
                     let eval = evals.eval_ext::<F>(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
@@ -599,20 +600,80 @@ where
         }
         proof.rounds[round_index].queries = queries;
 
-        let constraint = Constraint::new(
-            challenger.sample_algebra_element(),
-            ood_statement,
-            stir_statement,
-        );
+        let challenge: EF = challenger.sample_algebra_element();
+
+        let d = EF::DIMENSION;
+        let gpu_done = num_variables >= 14
+            && !stir_vars.is_empty()
+            && d == 4
+            && matches!(
+                round_state.sumcheck_prover.poly,
+                ProductPolynomial::Packed { .. }
+            )
+            && {
+                let alpha_shift = ood_statement.len();
+                let alphas_ef: Vec<EF> = challenge
+                    .powers()
+                    .skip(alpha_shift)
+                    .take(stir_vars.len())
+                    .collect();
+                let alphas_raw: &[u32] = unsafe {
+                    std::slice::from_raw_parts(alphas_ef.as_ptr().cast(), alphas_ef.len() * d)
+                };
+
+                if let Some(gpu_result) = info_span!("gpu_combine_select").in_scope(|| {
+                    self.mmcs
+                        .gpu_combine_select_weights(&stir_vars, alphas_raw, num_variables)
+                }) {
+                    if let ProductPolynomial::Packed {
+                        ref mut weights, ..
+                    } = round_state.sumcheck_prover.poly
+                    {
+                        ood_statement.combine_hypercube_packed::<F, true>(
+                            weights,
+                            &mut round_state.sumcheck_prover.sum,
+                            challenge,
+                        );
+
+                        stir_statement.combine_evals(
+                            &mut round_state.sumcheck_prover.sum,
+                            challenge,
+                            ood_statement.len(),
+                        );
+
+                        let packed_len = gpu_result.len() / (d * d);
+                        let gpu_packed: &[EF::ExtensionPacking] = unsafe {
+                            std::slice::from_raw_parts(gpu_result.as_ptr().cast(), packed_len)
+                        };
+                        for (w, g) in weights.as_mut_slice().iter_mut().zip(gpu_packed.iter()) {
+                            *w += *g;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
 
         let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
-        let folding_randomness = round_state.sumcheck_prover.compute_sumcheck_polynomials(
-            &mut sumcheck_data,
-            challenger,
-            folding_factor_next,
-            round_params.folding_pow_bits,
-            Some(constraint),
-        );
+        let folding_randomness = if gpu_done {
+            round_state.sumcheck_prover.compute_sumcheck_polynomials(
+                &mut sumcheck_data,
+                challenger,
+                folding_factor_next,
+                round_params.folding_pow_bits,
+                None,
+            )
+        } else {
+            let constraint = Constraint::new(challenge, ood_statement, stir_statement);
+            round_state.sumcheck_prover.compute_sumcheck_polynomials(
+                &mut sumcheck_data,
+                challenger,
+                folding_factor_next,
+                round_params.folding_pow_bits,
+                Some(constraint),
+            )
+        };
         proof.set_sumcheck_data_at(sumcheck_data, round_index);
 
         round_state.folding_randomness = folding_randomness;

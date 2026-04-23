@@ -1,0 +1,334 @@
+warning: unused import: `RowMajorMatrix`
+  --> src/whir/prover/mod.rs:10:26
+   |
+10 |     dense::{DenseMatrix, RowMajorMatrix, RowMajorMatrixView},
+   |                          ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ExtensionField` and `PrimeField64`
+    --> src/gpu_dft.rs:2600:16
+     |
+2600 | use p3_field::{ExtensionField, PrimeField64};
+     |                ^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `CryptographicPermutation`
+    --> src/gpu_dft.rs:2601:20
+     |
+2601 | use p3_symmetric::{CryptographicPermutation, Hash, MerkleCap};
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning[E0133]: call to unsafe function `gpu_dft::nontemporal_copy` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:193:9
+    |
+193 |         nontemporal_copy(dst, src, len);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+   --> src/gpu_dft.rs:190:1
+    |
+190 | unsafe fn fast_memcpy_from_gpu(dst: *mut u8, src: *const u8, len: usize) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: use of inline assembly is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:214:9
+    |
+214 | /         core::arch::asm!(
+215 | |             "ldnp q0, q1, [{src}]",
+216 | |             "ldnp q2, q3, [{src}, #32]",
+217 | |             "stnp q0, q1, [{dst}]",
+...   |
+224 | |             out("v3") _,
+225 | |         );
+    | |_________^ use of inline assembly
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: inline assembly is entirely unchecked and can cause undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+   --> src/gpu_dft.rs:211:1
+    |
+211 | unsafe fn nontemporal_copy(dst: *mut u8, src: *const u8, len: usize) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::add` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:219:27
+    |
+219 |             src = in(reg) src.add(i),
+    |                           ^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::mut_ptr::<impl *mut T>::add` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:220:27
+    |
+220 |             dst = in(reg) dst.add(i),
+    |                           ^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::copy_nonoverlapping` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:229:9
+    |
+229 |         std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::add` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:229:39
+    |
+229 |         std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+    |                                       ^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::mut_ptr::<impl *mut T>::add` is unsafe and requires unsafe block
+   --> src/gpu_dft.rs:229:51
+    |
+229 |         std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+    |                                                   ^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning: unused variable: `height`
+    --> src/gpu_dft.rs:2254:9
+     |
+2254 |         height: usize, full_width: usize,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_height`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: multiple fields are never read
+   --> src/gpu_dft.rs:252:5
+    |
+247 | pub struct MetalInner {
+    |            ---------- fields in this struct
+...
+252 |     bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^
+253 |     bitrev_gather_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^
+254 |     dif_r16_oop_ps: ComputePipelineState,
+255 |     butterfly_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^
+256 |     butterfly_r4_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^
+257 |     butterfly_r8_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^
+258 |     shared_mem_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^
+259 |     shared_mem_gs_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^
+260 |     stockham_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^
+261 |     stockham_gs_ps: ComputePipelineState,
+262 |     stockham_global_r2_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^^
+263 |     twiddle_transpose_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^
+264 |     dif_r32_ps: ComputePipelineState,
+    |     ^^^^^^^^^^
+...
+269 |     dif_r32_bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^
+270 |     dif_r16_bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^
+271 |     dif_r8_bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^
+272 |     dif_r4_bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^
+273 |     dif_r2_bitrev_ps: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^
+...
+277 |     max_log_stockham_block: u32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `0` is never read
+   --> src/gpu_dft.rs:331:30
+    |
+331 | struct MerkleBufferKeepalive(Buffer);
+    |        --------------------- ^^^^^^
+    |        |
+    |        field in this struct
+    |
+    = help: consider removing this field
+
+warning: multiple associated items are never used
+    --> src/gpu_dft.rs:685:8
+     |
+ 364 | impl MetalBabyBearDft {
+     | --------------------- associated items in this implementation
+...
+ 685 |     fn effective_log_block(&self, log_n: u32) -> u32 {
+     |        ^^^^^^^^^^^^^^^^^^^
+...
+ 904 |     fn read_merkle_layers(layers: &MerkleLayers) -> (
+     |        ^^^^^^^^^^^^^^^^^^
+...
+1291 |     fn encode_dif_stages_only(
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+1418 |     fn encode_bitrev_gather(
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+1612 |     fn dispatch_stockham(
+     |        ^^^^^^^^^^^^^^^^^
+...
+1642 |     fn dispatch_shared_mem(
+     |        ^^^^^^^^^^^^^^^^^^^
+...
+1673 |     fn dispatch_shared_mem_gs(
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+1751 |     fn encode_stockham_full(
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+2007 |     fn encode_dif_ntt_gather(
+     |        ^^^^^^^^^^^^^^^^^^^^^
+...
+2125 |     fn encode_classic_ntt(
+     |        ^^^^^^^^^^^^^^^^^^
+...
+2236 |     fn extract_columns(
+     |        ^^^^^^^^^^^^^^^
+...
+2251 |     fn merge_columns(
+     |        ^^^^^^^^^^^^^
+
+warning: type does not implement `Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+   --> src/gpu_dft.rs:243:1
+    |
+243 | / pub struct MetalBabyBearDft {
+244 | |     inner: Arc<MetalInner>,
+245 | | }
+    | |_^
+    |
+    = note: requested on the command line with `-W missing-debug-implementations`
+
+warning: type does not implement `Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+   --> src/gpu_dft.rs:247:1
+    |
+247 | / pub struct MetalInner {
+248 | |     cpu: Radix2DFTSmallBatch<BabyBear>,
+249 | |     gpu_min_log_n: u32,
+250 | |     device: Device,
+...   |
+291 | |     merkle_buf_cache: Mutex<Option<Buffer>>,
+292 | | }
+    | |_^
+
+warning: type does not implement `Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+   --> src/gpu_dft.rs:333:1
+    |
+333 | / pub struct GpuMerkleResult {
+334 | |     pub cap: p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+335 | |     pub digest_layers: Vec<Vec<[BabyBear; 8]>>,
+336 | |     pub arity_schedule: Vec<usize>,
+337 | |     gpu_backed: Option<(usize, Box<dyn std::any::Any + Send + Sync>)>,
+338 | | }
+    | |_^
+
+warning: type does not implement `Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+    --> src/gpu_dft.rs:2611:1
+     |
+2611 | / pub struct GpuChallenger {
+2612 | |     pub inner: InnerChallenger,
+2613 | |     dft: MetalBabyBearDft,
+2614 | | }
+     | |_^
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `whir-p3` (lib) generated 18 warnings (run `cargo fix --lib -p whir-p3` to apply 6 suggestions)
+warning: unused import: `TwoAdicSubgroupDft`
+ --> src/bin/sweep.rs:6:35
+  |
+6 | use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
+  |                                   ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `whir-p3` (bin "sweep") generated 1 warning (run `cargo fix --bin "sweep" -p whir-p3` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running `target/release/sweep`
+n      fold   rate      CPU(ms)    GPU(ms)  FUSED(ms)  GRIND(ms)  gpu/cpu fused/cpu grind/cpu
+------------------------------------------------------------------------------------------------------------------------
+18     1      1            94.0       87.8       84.4       85.2    1.07x    1.11x    1.10x
+18     1      2           136.0      104.5       91.5       94.2    1.30x    1.49x    1.44x
+18     1      3           242.9      155.0      141.7      162.4    1.57x    1.71x    1.50x
+18     2      1            39.6       40.7       37.7       46.6    0.97x    1.05x    0.85x
+18     2      2            63.4       50.5       46.1       61.7    1.26x    1.38x    1.03x
+18     2      3           104.1       fail       61.6       72.7        -    1.69x    1.43x
+18     3      1            20.2       21.5       31.4       84.4    0.94x    0.64x    0.24x
+18     3      2            39.1       34.0       32.5       33.2    1.15x    1.20x    1.18x
+18     3      3            66.5       40.9       38.5       42.0    1.63x    1.73x    1.58x
+18     4      1            14.2       17.4       fail       fail    0.82x        -        -
+18     4      2            26.0       fail       22.0       29.9        -    1.18x    0.87x
+18     4      3            40.7       28.2       30.8       32.8    1.44x    1.32x    1.24x
+18     6      1            10.7       14.3       16.0       20.7    0.75x    0.67x    0.52x
+18     6      2            19.3       15.3       16.0       24.5    1.26x    1.21x    0.79x
+18     6      3            26.7       22.9       20.2       26.4    1.17x    1.32x    1.01x
+18     8      1            10.2       21.8       21.6       29.0    0.47x    0.47x    0.35x
+18     8      2            18.9       23.8       23.1       33.7    0.79x    0.82x    0.56x
+18     8      3            31.2       41.1       35.9       41.6    0.76x    0.87x    0.75x
+20     1      1           293.5      197.8      184.8      190.4    1.48x    1.59x    1.54x
+20     1      2           529.9      314.5      279.0      295.9    1.68x    1.90x    1.79x
+20     1      3           926.6      570.0      515.2      531.1    1.63x    1.80x    1.74x
+20     2      1           125.1       90.7       85.7       91.5    1.38x    1.46x    1.37x
+20     2      2           226.6       fail      121.5      132.4        -    1.87x    1.71x
+20     2      3           436.3      240.7      213.6      240.4    1.81x    2.04x    1.81x
+20     3      1            65.3       57.8       45.2       58.8    1.13x    1.44x    1.11x
+20     3      2           100.2       73.3       65.3       76.6    1.37x    1.53x    1.31x
+20     3      3           192.6      123.1      112.9      126.0    1.56x    1.71x    1.53x
+20     4      1            47.4       fail       43.2       50.0        -    1.10x    0.95x
+20     4      2            87.9       fail       56.4       65.2        -    1.56x    1.35x
+20     4      3           177.1       fail      136.2      124.0        -    1.30x    1.43x
+20     6      1            39.3       47.3       47.2       36.5    0.83x    0.83x    1.08x
+20     6      2           109.2      117.5      106.9       67.9    0.93x    1.02x    1.61x
+20     6      3           456.0       fail      443.0      305.9        -    1.03x    1.49x
+20     8      1            27.1       33.3       34.5       38.7    0.81x    0.79x    0.70x
+20     8      2            49.4       38.5       fail       49.7    1.28x        -    0.99x
+20     8      3           113.8       75.4       fail       82.9    1.51x        -    1.37x
+22     1      1          1339.6      730.5      668.8      658.8    1.83x    2.00x    2.03x
+22     1      2          2006.5       fail     1088.5     1078.9        -    1.84x    1.86x
+22     1      3          3930.4     2431.8     2118.9     2582.1    1.62x    1.85x    1.52x
+22     2      1           505.4       fail      291.0      289.9        -    1.74x    1.74x
+22     2      2           858.4       fail      443.5      474.1        -    1.94x    1.81x
+22     2      3          1736.1       fail      862.6      867.4        -    2.01x    2.00x
+22     3      1           229.9      158.6      149.4      155.9    1.45x    1.54x    1.47x
+22     3      2           422.8      276.8      247.2      266.5    1.53x    1.71x    1.59x
+22     3      3          1093.4      584.4      551.8      540.0    1.87x    1.98x    2.02x
+22     4      1           172.6       fail      107.1      116.2        -    1.61x    1.49x
+22     4      2           330.0       fail      191.1      199.5        -    1.73x    1.65x
+22     4      3           741.6      458.9      450.8      414.6    1.62x    1.65x    1.79x
+22     6      1           148.2      101.8       fail       99.7    1.46x        -    1.49x
+22     6      2           381.8      381.0      388.5      262.1    1.00x    0.98x    1.46x
+22     6      3          1766.4       fail     1406.9      820.9        -    1.26x    2.15x
+22     8      1            93.6       66.3       fail       fail    1.41x        -        -
+22     8      2           200.3      135.3       fail      141.9    1.48x        -    1.41x
+22     8      3           487.2       fail      259.2      279.2        -    1.88x    1.74x
+24     1      1          4508.5       fail     2586.7     2524.0        -    1.74x    1.79x
+24     1      2          8551.0       fail     4029.3     4011.2        -    2.12x    2.13x
+24     1      3         19296.3       fail    13904.2    13803.3        -    1.39x    1.40x
+24     2      1          1874.3     1211.1     1074.8     1078.6    1.55x    1.74x    1.74x
+24     2      2          3747.6       fail     1793.9     1830.9        -    2.09x    2.05x
+24     2      3          6924.2       fail     3460.2     3500.4        -    2.00x    1.98x
+24     3      1          1072.0      611.4      547.8      570.2    1.75x    1.96x    1.88x
+24     3      2          1755.3       fail      977.8      951.4        -    1.80x    1.84x
+24     3      3          4228.0     2418.3     2006.3     1962.9    1.75x    2.11x    2.15x
+24     4      1          1066.0       fail      771.4      619.0        -    1.38x    1.72x
+24     4      2          3524.9       fail     2900.6     1935.0        -    1.22x    1.82x
+24     4      3         32791.4       fail    24526.5     8296.6        -    1.34x    3.95x
+24     6      1           549.9       fail      394.2      333.5        -    1.39x    1.65x
+24     6      2          1721.4       fail     1242.2      953.2        -    1.39x    1.81x
+24     6      3         13335.9       fail     4193.7     3826.8        -    3.18x    3.48x
+24     8      1         35281.6       fail       fail       fail        -        -        -

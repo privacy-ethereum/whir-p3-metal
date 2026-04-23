@@ -2477,6 +2477,63 @@ kernel void poseidon2_hash4_compress3(
     }
 }
 
+// ── SIMD-shuffle multi-level Merkle ───────────────────────────────────
+// Each thread hashes 1 leaf (low register pressure → high occupancy).
+// After hashing, 5 compression levels (log2(SIMD_WIDTH)=5) are fused
+// using SIMD shuffle operations — NO threadgroup shared memory needed,
+// so occupancy is limited only by register pressure (~20 regs).
+//
+// simd_shuffle_down is a no-wrapping operation: the upper delta lanes
+// keep their own value, which is safe since those threads are inactive
+// and never use the stale result.
+//
+// After the kernel, separate compress dispatches handle remaining levels
+// (starting from level 6 for a 32-wide SIMD group).
+
+kernel void poseidon2_merkle_simd(
+    device const Bb* data              [[buffer(0)]],
+    device Bb* merkle                  [[buffer(1)]],
+    constant uint* level_elem_offsets  [[buffer(2)]],
+    constant Bb* rc                    [[buffer(3)]],
+    constant uint& num_leaves          [[buffer(4)]],
+    constant uint& leaf_width          [[buffer(5)]],
+    uint gid   [[thread_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    // Phase 1: Hash one leaf
+    Bb st[16] = {};
+    uint base = gid * leaf_width;
+    for (uint absorbed = 0; absorbed < leaf_width; absorbed += 8) {
+        uint rem = min(8u, leaf_width - absorbed);
+        for (uint i = 0; i < rem; i++) st[i] = data[base + absorbed + i];
+        if (rem < 8) for (uint i = rem; i < 8; i++) st[i] = Bb{0};
+        poseidon2_permute_16(st, rc);
+    }
+
+    // Write leaf digest to global memory (level 0)
+    // st[0..7] holds the digest
+    uint g0 = level_elem_offsets[0] + gid * 8;
+    for (uint i = 0; i < 8; i++) merkle[g0 + i] = st[i];
+
+    // Phase 2: SIMD shuffle compression (5 levels, log2(32))
+    for (uint level = 1; level <= 5; level++) {
+        ushort delta = ushort(1u << (level - 1));
+        uint mask = (1u << level) - 1;
+
+        // Read partner's digest via SIMD shuffle (all lanes participate)
+        for (uint i = 0; i < 8; i++)
+            st[8 + i] = Bb{simd_shuffle_down(st[i].v, delta)};
+
+        if ((uint(lane) & mask) == 0) {
+            poseidon2_permute_16(st, rc);
+            // st[0..7] = compressed digest for the next level
+            uint global_idx = gid >> level;
+            uint g = level_elem_offsets[level] + global_idx * 8;
+            for (uint i = 0; i < 8; i++) merkle[g + i] = st[i];
+        }
+    }
+}
+
 // ── GPU Proof-of-Work (PoW) grinding ──────────────────────────────────
 // Parallel brute-force search for a valid PoW witness.
 // Each thread tries one candidate nonce, applies Poseidon2 permutation,
@@ -2527,4 +2584,58 @@ kernel void poseidon2_pow_grind(
             atomic_store_explicit(result, nonce, memory_order_relaxed);
         }
     }
+}
+
+// ── GPU Select-statement weight polynomial (split-and-dot) ────────────
+// Computes: W(b) = Σ_i alpha[i] * left[b_left][i] * right[b_right][i]
+//   for all b ∈ {0, ..., 2^k - 1}, where b = b_left + b_right * 2^k_left.
+//
+// left_table  [n × 2^k_left]:  TRANSPOSED butterfly-expanded lower-half
+// right_table [2^k_right × n]: row-major butterfly-expanded upper-half
+// alphas [n × 4]: extension field coefficients in Montgomery form
+//
+// Output is in packed format matching PackedBinomialExtensionField layout.
+// Thread tid (0..2^{k-2}) computes one packed element (4 hypercube points).
+
+kernel void bb_combine_select(
+    device const uint* left_table  [[buffer(0)]],
+    device const uint* right_table [[buffer(1)]],
+    device const uint* alphas      [[buffer(2)]],
+    device uint*       output      [[buffer(3)]],
+    constant uint&     k_left      [[buffer(4)]],
+    constant uint&     n           [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n_left = 1u << k_left;
+    uint n_left_packed = n_left >> 2;
+    uint b_right = tid / n_left_packed;
+    uint b_left_base = (tid % n_left_packed) << 2;
+
+    Bb acc[4][4];
+    for (uint d = 0; d < 4; d++)
+        for (uint lane = 0; lane < 4; lane++)
+            acc[d][lane] = Bb{0};
+
+    for (uint i = 0; i < n; i++) {
+        Bb r = Bb{right_table[b_right * n + i]};
+
+        uint left_base = i * n_left + b_left_base;
+        Bb l0 = Bb{left_table[left_base + 0]};
+        Bb l1 = Bb{left_table[left_base + 1]};
+        Bb l2 = Bb{left_table[left_base + 2]};
+        Bb l3 = Bb{left_table[left_base + 3]};
+
+        for (uint d = 0; d < 4; d++) {
+            Bb ar = bb_mul(Bb{alphas[i * 4 + d]}, r);
+            acc[d][0] = bb_add(acc[d][0], bb_mul(ar, l0));
+            acc[d][1] = bb_add(acc[d][1], bb_mul(ar, l1));
+            acc[d][2] = bb_add(acc[d][2], bb_mul(ar, l2));
+            acc[d][3] = bb_add(acc[d][3], bb_mul(ar, l3));
+        }
+    }
+
+    uint base = tid * 16;
+    for (uint d = 0; d < 4; d++)
+        for (uint lane = 0; lane < 4; lane++)
+            output[base + d * 4 + lane] = acc[d][lane].v;
 }

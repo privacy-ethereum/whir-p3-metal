@@ -105,6 +105,10 @@ name = "sweep"
 path = "src/bin/sweep.rs"
 required-features = ["gpu-metal"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [profile.profiling]
 inherits = "release"
 debug = true

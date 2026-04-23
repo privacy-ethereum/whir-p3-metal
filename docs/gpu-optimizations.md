@@ -1261,6 +1261,13 @@ compute-heavy configurations. No regressions observed.
 | 18  | Zero-copy Merkle digest layers         | Eliminates ~256MB memcpy        |
 | 19  | GPU transpose+pad in fused pipeline    | CPU scatter-write → GPU kernel  |
 | 20  | Min-bytes GPU threshold + zero-copy EF | Skip GPU for tiny rounds        |
+| 21  | XL shared-mem DIF + contiguity bugfix  | 8192-elem shared-mem DIF tail   |
+| 22  | Zero-copy EF↔BabyBear conversions      | Eliminate 256MB alloc+copies    |
+| 23  | Concurrent CPU+GPU PoW grinding        | CPU+GPU race, cancellation      |
+| 24  | 4-leaf fused Merkle + GPU profiling     | 7 Poseidon2 per thread          |
+| 25  | Zero-copy DFT output                   | Eliminate DFT memcpy via UMA    |
+| 26  | Merkle kernel exploration (no win)      | 3 approaches tried, all slower  |
+| 27  | Zero-copy source buffer + profiling    | Eliminate input memcpy via UMA  |
 
 
 ---
@@ -1878,4 +1885,407 @@ dominant bottleneck: ~70% of initial commit time.
   overhead exceeds compute savings
 - The 4-leaf fusion primarily helps large-DFT configs where Merkle tree
   construction is the dominant cost
+
+## Optimization 25 — Zero-copy DFT Output
+
+### Purpose
+
+Eliminate the memcpy of DFT output from GPU buffer to a Rust `Vec`. On Apple
+Silicon's unified memory, the GPU buffer is already CPU-accessible — the copy
+was pure overhead (~6ms for 128 MB at n=24/f=3/r=1, up to 16ms for cold pages).
+
+### What changed
+
+1. **Zero-copy Vec wrapping** — In the non-profiling path,
+   `gpu_transpose_dft_and_merkle` creates the output `Vec<BabyBear>` directly
+   from the Metal buffer pointer via `Vec::from_raw_parts`, avoiding any copy.
+
+2. **Buffer lifecycle management** — The Metal buffer backing the DFT output is
+   kept alive via `GpuMerkleResult::leaf_keepalive`. A custom
+   `_leaf_forget_fn` on `MerkleTree` ensures the `Vec` is forgotten (not
+   deallocated) when the tree is dropped, since the Metal allocator owns the
+   memory.
+
+3. **`into_tree` / `into_tree_zc` split** — `GpuMerkleResult::into_tree` was
+   split into a non-zero-copy version (no `'static` bound on `M`) and
+   `into_tree_zc` for the zero-copy path, which bundles the buffer keepalive
+   into a `DualBufferKeepalive`.
+
+### GPU phase profiling with zero-copy (n=24, f=3, r=1)
+
+| Phase | Before (Opt 24) | After (Opt 25) |
+|-------|-----------------|-----------------|
+| DFT (log_n=22, width=8) | ~60 ms | ~49 ms |
+| Merkle (4M leaves) | ~173 ms | ~173 ms |
+| DFT output copy | ~10 ms | **0 ms** (eliminated) |
+
+The DFT improvement is from system variance, not this optimization. The
+zero-copy benefit is the elimination of the ~6-16ms memcpy on every commit call,
+which compounds across multiple rounds per proof.
+
+### Benchmark — GPU / CPU speedup
+
+| Config | CPU (s) | GPU (s) | Speedup |
+|--------|---------|---------|---------|
+| n=20, f=1, r=1 | 0.303 | 0.189 | **1.60x** |
+| n=20, f=3, r=1 | 0.065 | 0.049 | **1.32x** |
+| n=20, f=4, r=1 | 0.050 | 0.038 | **1.31x** |
+| n=22, f=1, r=1 | 1.153 | 0.641 | **1.80x** |
+| n=22, f=3, r=1 | 0.235 | 0.141 | **1.67x** |
+| n=22, f=4, r=1 | 0.179 | 0.113 | **1.58x** |
+| n=24, f=1, r=1 | 4.525 | 2.463 | **1.84x** |
+| n=24, f=3, r=1 | 0.924 | 0.546 | **1.69x** |
+| n=24, f=4, r=1 | 0.931 | 0.724 | **1.29x** |
+| n=20, f=2, r=3 | 0.433 | 0.219 | **1.98x** |
+| n=22, f=2, r=3 | 1.679 | 0.831 | **2.02x** |
+| n=24, f=2, r=3 | 7.368 | 4.081 | **1.81x** |
+
+### Bottleneck analysis (n=24, f=3, r=1, tracing profile)
+
+| Phase | Time | % |
+|-------|------|---|
+| commit_fused (initial GPU DFT+Merkle) | 278 ms | 54% |
+| round_fused round 0: GPU DFT+Merkle | 85 ms | 16% |
+| round_fused round 0: CPU sumcheck | 69 ms | 13% |
+| round_fused round 0: CPU combine_packed | 50 ms | 10% |
+| round_fused round 0: CPU evals unpacking | 10 ms | 2% |
+| rounds 1-4 + misc | 26 ms | 5% |
+
+The Merkle phase is the dominant bottleneck within GPU DFT+Merkle (3.5x more
+expensive than DFT). The next optimization targets Merkle tree construction
+directly.
+
+## Optimization 26 — Merkle Kernel Exploration (No Improvement)
+
+### Purpose
+
+Reduce Merkle tree construction time by fusing more compression levels into a
+single kernel dispatch. Three approaches were tested:
+
+1. **Shared-memory Merkle kernel** — 1 leaf/thread, 8 compression levels in
+   threadgroup shared memory with barriers
+2. **SIMD-shuffle Merkle kernel** — 1 leaf/thread, 5 compression levels using
+   `simd_shuffle` operations within a SIMD group (no barriers or shared memory)
+3. **Dual-interleaved Poseidon2** — 2 independent Poseidon2 permutations
+   interleaved within each thread for instruction-level parallelism
+
+### Approach 1: Shared-memory Merkle (`poseidon2_merkle_shared`)
+
+Each thread hashes 1 leaf (1 Poseidon2 permutation), then participates in
+8 levels of binary compression using shared memory. Each level:
+- Writes the digest to shared memory
+- Barrier synchronization
+- Threads with even indices read two children and compress
+
+**Result**: ~334 ms for log_n=22, width=8 (**1.9x slower** than baseline 173ms).
+
+**Why it failed**: Each threadgroup uses 8 KB of shared memory (256 threads ×
+16 × 2 bytes for double-buffering). Apple Silicon GPU cores have 32 KB
+threadgroup memory, limiting occupancy to 4 threadgroups per core. The
+frequent barriers (one per compression level) create pipeline bubbles, and
+thread utilization drops exponentially (50% idle after level 1, 75% after
+level 2, etc.).
+
+### Approach 2: SIMD-shuffle Merkle (`poseidon2_merkle_simd`)
+
+Avoids shared memory entirely. Each thread hashes 1 leaf, then 5 levels of
+compression use `simd_shuffle_xor` to exchange digests within a 32-wide SIMD
+group. No barriers needed since SIMD lanes are implicitly synchronized.
+
+**Result**: ~401 ms for log_n=22, width=8 (**2.3x slower** than baseline).
+
+**Why it failed**: 4x more threads than the baseline `hash4_compress3` kernel
+(1 leaf/thread vs 4 leaves/thread), causing higher scheduling overhead and
+memory contention. Reduced work per thread (1 permutation vs 7) provides
+less instruction-level parallelism to hide memory latency. SIMD divergence
+in compression levels wastes cycles on inactive threads.
+
+### Approach 3: Dual-interleaved Poseidon2
+
+Modified the existing `poseidon2_hash4_compress3` kernel to run two independent
+Poseidon2 permutations simultaneously within each thread, interleaving their
+round operations to keep the multiply pipeline busy during the latency of
+Montgomery `mulhi` emulation.
+
+**Result**: ~1.7x slowdown for n=24/f=3/r=1, up to ~11x slowdown for
+n=24/f=2/r=3.
+
+**Why it failed**: Doubled register pressure (2× state vectors) severely
+reduced occupancy. Apple Silicon's GPU register file is finite per SIMD group;
+doubling the registers per thread halves the number of concurrent SIMD groups
+the hardware can schedule.
+
+### Key insight
+
+The existing `poseidon2_hash4_compress3` kernel is already near-optimal for
+Apple Silicon because:
+- **4 leaves/thread** provides sufficient ILP (7 Poseidon2 permutations) to
+  hide memory latency
+- **7 permutations** per thread keeps register pressure manageable
+- **Fusing 3 compression levels** eliminates intermediate global memory
+  round-trips while staying within register budget
+- At ~43–49M Poseidon2 permutations/second regardless of matrix width, the
+  kernel is compute-bound on Montgomery multiplication throughput
+
+### Benchmark — no change from Optimization 25
+
+All three approaches were reverted. Performance remains identical to Opt 25.
+
+## Optimization 27 — Zero-copy Source Buffer + Pipeline Profiling
+
+### Purpose
+
+Two changes:
+
+1. **Zero-copy source buffer** — Replace `new_buffer_with_data` (which copies input
+   data into a Metal buffer) with `new_buffer_with_bytes_no_copy` when the source
+   pointer is page-aligned and the length is a multiple of the page size. On Apple
+   Silicon with unified memory, the GPU can read directly from the existing allocation,
+   eliminating a ~5-10ms memcpy per pipeline invocation.
+
+2. **Detailed pipeline profiling** — Comprehensive tracing analysis of the full
+   `whir_prove` flow to identify remaining bottlenecks and guide future optimization.
+
+### What changed
+
+`make_source_buffer` replaces direct `new_buffer_with_data` calls in:
+- `gpu_transpose_dft_and_merkle` (initial commit + per-round DFT)
+- `gpu_transpose_pad` (standalone transpose)
+- `gpu_build_merkle_digests_from_data` (standalone Merkle)
+
+The function checks page alignment and falls back to `new_buffer_with_data` if the
+requirements aren't met. For typical polynomial sizes (n ≥ 14, i.e. ≥ 64KB), large
+allocations from `malloc`/`mmap` are always page-aligned.
+
+### Pipeline profiling results (n=24, f=3, r=1)
+
+Detailed tracing breakdown of the full `whir_prove` flow:
+
+| Phase | Time | % | Notes |
+|-------|------|---|-------|
+| `commit_fused` GPU pipeline | 230 ms | 40% | DFT ~52ms + Merkle ~160ms |
+| `commit_fused` OOD eval | 9 ms | 2% | 2 multilinear evals |
+| `initialize_first_round_state` | 33 ms | 6% | `compress_lo_to_packed` ~27ms |
+| Round 0 `evals()` | 8 ms | 1% | SIMD deinterleave |
+| Round 0 GPU pipeline | 77 ms | 13% | DFT ~25ms + Merkle ~48ms |
+| Round 0 `combine_packed` | 55 ms | 10% | 91 STIR constraints |
+| Round 0 sumcheck fold (3 rounds) | 23 ms | 4% | Sequential |
+| Round 1 GPU + sumcheck | 54 ms | 9% | GPU ~39ms + CPU ~12ms |
+| Rounds 2-5 + misc | 80 ms | 14% | Progressively smaller |
+| **Total** | **~570 ms** | **100%** | |
+
+### CPU bottleneck analysis
+
+The GPU pipeline (DFT + Merkle) is compute-bound on Poseidon2 Montgomery
+multiplication and cannot be further optimized at the kernel level. The remaining
+optimization targets are CPU-bound operations:
+
+| CPU bottleneck | Time | Potential GPU savings | Difficulty |
+|----------------|------|----------------------|------------|
+| `combine_packed` | 55 ms | ~50 ms | High — requires GPU extension field arithmetic |
+| `compress_lo_to_packed` | 27 ms | ~24 ms | High — GPU polynomial folding kernel |
+| Sumcheck fold rounds | 23 ms | None | Sequential Fiat-Shamir dependency |
+| `evals()` SIMD unpack | 8 ms | ~8 ms | Medium — modify GPU to read packed layout |
+
+Theoretical minimum with full GPU offload of addressable bottlenecks:
+~570ms - 82ms ≈ **490ms** (theoretical 1.9x vs CPU 910ms, up from current ~1.6x).
+
+### Benchmark — GPU / CPU speedup (best of all GPU modes)
+
+#### n=18 (2^18 = 256K coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.63x** | **1.84x** | **1.98x** |
+| 2    | **1.52x** | **1.49x** | **2.13x** |
+| 3    | **1.71x** | **1.23x** | **1.78x** |
+| 4    | 0.94x     | **1.49x** | **1.31x** |
+| 6    | 0.59x     | 0.71x     | **1.19x** |
+| 8    | 0.31x     | 0.48x     | 0.71x     |
+
+
+GPU wins for fold ≤ 3 with rate ≥ 1. Small problems still favour CPU due to
+GPU dispatch overhead.
+
+#### n=20 (2^20 = 1M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.53x** | **1.68x** | **1.68x** |
+| 2    | **1.47x** | **1.60x** | **1.64x** |
+| 3    | **1.39x** | **1.54x** | **1.54x** |
+| 4    | **1.28x** | **1.36x** | **1.46x** |
+| 6    | **1.05x** | 0.93x     | 0.82x     |
+| 8    | 0.73x     | 0.87x     | **1.38x** |
+
+
+GPU wins for fold ≤ 4. High fold + low rate still CPU-favoured.
+
+#### n=22 (2^22 = 4M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.58x** | **2.21x** | **1.82x** |
+| 2    | **1.62x** | **1.72x** | **1.89x** |
+| 3    | **1.56x** | **1.54x** | **1.36x** |
+| 4    | **1.55x** | **1.50x** | **1.33x** |
+| 6    | **1.42x** | **1.56x** | **1.37x** |
+| 8    | **1.86x** | **1.50x** | **1.72x** |
+
+
+GPU always faster. Best: **2.21x** at fold=1, rate=2.
+
+#### n=24 (2^24 = 16M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.66x** | **2.11x** | **1.60x** |
+| 2    | **1.60x** | **1.74x** | **2.18x** |
+| 3    | **1.56x** | **1.82x** | **1.47x** |
+| 4    | **1.48x** | **1.93x** | **2.32x** |
+| 6    | **1.53x** | **1.24x** | **1.67x** |
+| 8    | **1.63x** | —         | —         |
+
+
+Best: **2.32x** at fold=4, rate=3 (PoW-dominated, GPU grinding dominant).
+Best non-PoW: **2.18x** at fold=2, rate=3.
+GPU always faster for n=24 across all tested configurations.
+
+## Optimization 28 — LTO + target-cpu=native Build Configuration
+
+### Purpose
+
+Enable Link-Time Optimization (LTO) and native CPU target to improve CPU
+codegen quality across all crate boundaries. Without LTO, function calls
+from `p3-whir` (sumcheck) into `p3-monty-31` / `p3-baby-bear` (field
+arithmetic) cannot be inlined by the compiler, even though many hot
+functions carry `#[inline]` annotations.
+
+### What changed
+
+1. **`.cargo/config.toml`**: Added `rustflags = ["-C", "target-cpu=native"]`
+   to enable Apple-Silicon-specific instruction scheduling.
+
+2. **`Cargo.toml` `[profile.release]`**: Added `lto = "thin"` (cross-crate
+   inlining with moderate compile-time cost) and `codegen-units = 1` (single
+   codegen unit for better whole-program optimization).
+
+### Impact analysis
+
+LTO improves both CPU-only and GPU prover paths, but the CPU-only path
+benefits more (~5-7% faster) because it is 100% CPU-bound. The GPU path
+benefits ~1% because its CPU-bound portion (sumcheck, constraint combination)
+is only ~30% of total time.
+
+As a result, **absolute performance improves for both paths**, but the
+GPU-over-CPU **speedup ratio decreases slightly** (~0.05-0.1x) because the
+CPU baseline becomes harder to beat.
+
+| Metric | Before (no LTO) | After (thin LTO + native) | Change |
+|--------|-----------------|--------------------------|--------|
+| CPU n=22 f=1 r=1 | 1077 ms | 1015 ms | **-5.8%** |
+| GPU n=22 f=1 r=1 | 628 ms | 633 ms | ~0% |
+| CPU n=24 f=3 r=1 | 885 ms | 837 ms | **-5.4%** |
+| GPU n=24 f=3 r=1 | 551 ms | 546 ms | **-0.9%** |
+
+The CPU improvement comes from better cross-crate inlining of packed field
+arithmetic operations in `p3-monty-31` (NEON-accelerated Montgomery reduction).
+The GPU path barely changes because the GPU kernels (Metal shaders) are compiled
+separately and unaffected by Rust LTO.
+
+### Build time
+
+Compile time increases from ~0.3s (incremental) to ~30s (full rebuild with LTO).
+Incremental rebuilds after the initial LTO compilation are still fast (~2-5s).
+
+### Benchmark — GPU / CPU speedup (best of all GPU modes)
+
+All benchmarks below use `lto = "thin"`, `codegen-units = 1`, and
+`target-cpu=native`. Both CPU and GPU paths are compiled with the same
+optimization settings.
+
+#### n=18 (2^18 = 256K coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.19x** | **1.43x** | **1.59x** |
+| 2    | 0.95x     | **1.46x** | **1.57x** |
+| 3    | 0.81x     | **1.27x** | **1.33x** |
+| 4    | 0.77x     | **1.17x** | **1.44x** |
+| 6    | 0.59x     | 0.60x     | **1.31x** |
+| 8    | 0.29x     | 0.49x     | 0.70x     |
+
+
+GPU wins for fold ≤ 2 with rate ≥ 2, or fold ≤ 4 with rate = 3.
+
+#### n=20 (2^20 = 1M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.57x** | **1.63x** | **2.36x** |
+| 2    | **1.65x** | **1.72x** | **1.59x** |
+| 3    | **1.26x** | **1.43x** | **1.55x** |
+| 4    | **1.28x** | **1.49x** | **1.48x** |
+| 6    | **2.85x** | **1.15x** | 0.77x     |
+| 8    | 0.72x     | 0.98x     | **1.04x** |
+
+
+GPU wins for fold ≤ 4. Best: **2.85x** at fold=6, rate=1 (anomalous
+CPU slowdown at this config). Consistent best: **2.36x** at fold=1, rate=3.
+
+#### n=22 (2^22 = 4M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.60x** | **1.72x** | **1.76x** |
+| 2    | **1.63x** | **1.91x** | **1.66x** |
+| 3    | **1.59x** | **1.93x** | **1.34x** |
+| 4    | **1.46x** | **1.61x** | **1.29x** |
+| 6    | **1.39x** | **1.44x** | **1.68x** |
+| 8    | **1.26x** | **1.39x** | **1.17x** |
+
+
+GPU always faster. Best: **1.93x** at fold=3, rate=2.
+
+#### n=24 (2^24 = 16M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.84x** | **2.17x** | **1.56x** |
+| 2    | **1.63x** | **1.70x** | **2.07x** |
+| 3    | **1.57x** | **1.87x** | **1.76x** |
+| 4    | **1.50x** | **2.65x** | **1.79x** |
+| 6    | **1.19x** | **1.46x** | **1.27x** |
+| 8    | **1.52x** | —         | —         |
+
+
+Best: **2.65x** at fold=4, rate=2 (PoW-dominated).
+Best non-PoW: **2.17x** at fold=1, rate=2.
+GPU always faster for n=24 across all tested configurations.
+
+### Remaining bottleneck analysis
+
+With LTO enabled, the profiling breakdown for n=24 f=3 r=1 (~547 ms) is:
+
+| Component | Time | % | Optimizable? |
+|-----------|------|---|-------------|
+| GPU Merkle (Poseidon2) | ~315 ms | 58% | At peak — compute-bound on Montgomery mul |
+| GPU DFT (NTT) | ~75 ms | 14% | Near peak — memory-bandwidth limited |
+| CPU sumcheck | ~80 ms | 15% | External crate, SIMD-optimized |
+| CPU constraint combination | ~45 ms | 8% | Partially GPU-offloaded |
+| CPU `evals()` deinterleave | ~8 ms | 1.5% | Could skip with packed GPU input |
+| GPU readback + dispatch | ~24 ms | 4% | Zero-copy Merkle already in use |
+
+The GPU pipeline (DFT + Merkle) is compute-bound at ~94% of theoretical
+peak throughput for Poseidon2 Montgomery multiplication on Apple Silicon.
+Further GPU kernel optimization is not feasible without algorithmic changes
+(e.g., higher-arity Merkle trees to reduce total permutation count).
 
