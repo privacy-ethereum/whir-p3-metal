@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. It runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
+We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. The implementation is open source and runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
 
 **Key findings:**
 
@@ -11,6 +11,8 @@ We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Sil
 - Apple Silicon's unified memory eliminates PCIe transfer costs, but introduces a subtler tradeoff: shared-mode buffers (CPU+GPU accessible) are slower for GPU compute than GPU-managed buffers due to cache coherence overhead. Our pipeline uses a hybrid approach.
 - The Poseidon2 Merkle kernel is the dominant cost (~58% of GPU time). Xcode GPU profiler shows high ALU utilization and no obvious stalls, suggesting we are close to hardware limits for this workload, though Apple does not publish precise integer throughput specs to confirm.
 - Compiler optimizations (LTO, `target-cpu=native`) improved the CPU baseline by ~25%, making the GPU harder to beat but improving absolute end-to-end performance
+
+**Repository**: [github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)
 
 Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a Rust implementation of the WHIR protocol using the [Plonky3](https://github.com/Plonky3/Plonky3) library. We added Metal GPU acceleration to this codebase. (Lineage: [WizardOfMenlo/whir](https://github.com/WizardOfMenlo/whir) → [whir-p3](https://github.com/tcoratger/whir-p3) → **whir-p3-metal**.)
 
@@ -408,7 +410,11 @@ The sumcheck protocol is the main remaining CPU bottleneck (~15% of runtime). Wh
 
 ## 10. Reproducibility
 
+All code is open source: **[github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)**
+
 Based on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3) (WHIR implementation using [Plonky3](https://github.com/Plonky3/Plonky3)).
+
+Links between Markdown files under `docs/` use **relative paths** (for example [`gpu-optimizations.md`](gpu-optimizations.md)) so on GitHub they open the same fork or org you are viewing. The `git clone` example below uses [privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal); if you work from another fork, use that fork’s HTTPS URL from the green **Code** button instead.
 
 ### Running on Mac
 
