@@ -12,8 +12,6 @@ We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Sil
 - The Poseidon2 Merkle kernel is the dominant cost (~58% of GPU time). Xcode GPU profiler shows high ALU utilization and no obvious stalls, suggesting we are close to hardware limits for this workload, though Apple does not publish precise integer throughput specs to confirm.
 - Compiler optimizations (LTO, `target-cpu=native`) improved the CPU baseline by ~25%, making the GPU harder to beat but improving absolute end-to-end performance
 
-**Canonical repository**: [github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)
-
 Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a Rust implementation of the WHIR protocol using the [Plonky3](https://github.com/Plonky3/Plonky3) library. We added Metal GPU acceleration to this codebase. (Lineage: [WizardOfMenlo/whir](https://github.com/WizardOfMenlo/whir) → [whir-p3](https://github.com/tcoratger/whir-p3) → **whir-p3-metal**.)
 
 ---
@@ -410,11 +408,11 @@ The sumcheck protocol is the main remaining CPU bottleneck (~15% of runtime). Wh
 
 ## 10. Reproducibility
 
-All code is open source: **[github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)**
+The implementation in this repository is open source.
 
 Based on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3) (WHIR implementation using [Plonky3](https://github.com/Plonky3/Plonky3)).
 
-Links between Markdown files under `docs/` use **relative paths** (for example [`gpu-optimizations.md`](gpu-optimizations.md)) so on GitHub they open the same fork or org you are viewing. Only the canonical clone URL below is fixed to `privacy-ethereum`; if you use a personal fork, replace it with your fork’s HTTPS URL from the green **Code** button.
+Cross-references between Markdown files under `docs/` use **relative paths** (for example [`gpu-optimizations.md`](gpu-optimizations.md)) so on GitHub they stay on the same fork or org you are viewing.
 
 ### Running on Mac
 
@@ -423,7 +421,7 @@ Links between Markdown files under `docs/` use **relative paths** (for example [
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
 source "$HOME/.cargo/env"
 
-# Clone and benchmark
+# Clone and benchmark (use your repository’s HTTPS URL from GitHub’s Code button)
 git clone https://github.com/privacy-ethereum/whir-p3-metal.git
 cd whir-p3-metal
 ./bench.sh           # ~15 min, saves results to bench_results_<timestamp>.txt
