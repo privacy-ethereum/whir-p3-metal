@@ -16,6 +16,8 @@ We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Sil
 
 Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a Rust implementation of the WHIR protocol using the [Plonky3](https://github.com/Plonky3/Plonky3) library. We added Metal GPU acceleration to this codebase. (Lineage: [WizardOfMenlo/whir](https://github.com/WizardOfMenlo/whir) → [whir-p3](https://github.com/tcoratger/whir-p3) → **whir-p3-metal**.)
 
+**Disclosure.** The Metal GPU implementation (Rust and MSL), supporting tooling, and the prose in this article were produced with substantial assistance from [Claude](https://www.anthropic.com/claude) (Anthropic), an AI coding assistant, under human direction, review, and benchmarking. Cryptographic soundness follows the published WHIR / Plonky3 specifications and upstream code; any mistakes in integration, performance claims, or interpretation remain the responsibility of the project maintainers.
+
 ---
 
 ## 1. Motivation: Why Client-Side Proving Matters
