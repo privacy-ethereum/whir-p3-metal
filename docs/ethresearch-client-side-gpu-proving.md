@@ -5,6 +5,7 @@
 We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. The implementation is open source and runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
 
 **Key findings:**
+
 - GPU wins for all tested configurations at polynomial sizes >= 2^20 (1M+ coefficients)
 - Fused DFT+Merkle pipeline avoids CPU round-trips and provides the biggest gains
 - Apple Silicon's unified memory eliminates PCIe transfer costs, but introduces a subtler tradeoff: shared-mode buffers (CPU+GPU accessible) are slower for GPU compute than GPU-managed buffers due to cache coherence overhead. Our pipeline uses a hybrid approach.
@@ -22,6 +23,7 @@ Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a 
 Ethereum's transparency comes at a privacy cost: every transaction is permanently visible, and chain analysis tools can link pseudonymous addresses to real identities. Zero-knowledge proofs can restore privacy, but delegating proof generation to a server defeats the purpose -- the server sees your private inputs.
 
 True privacy requires **client-side proving**: users generate proofs on their own devices. This matters for:
+
 - **Private payments** -- hiding amounts, counterparties, and transaction patterns
 - **Identity** -- proving facts about credentials (age, citizenship, membership) without revealing the credential itself ([ZK Email](https://prove.email/), [Anon Aadhaar](https://github.com/anon-aadhaar/anon-aadhaar))
 - **Voting** -- anonymous participation in DAOs and governance ([Semaphore](https://semaphore.pse.dev/))
@@ -33,6 +35,7 @@ The barrier is performance. Proving on consumer hardware must be fast enough for
 Modern phones and laptops contain increasingly capable GPUs. Apple Silicon's M-series and A-series chips share unified memory between CPU and GPU, eliminating the PCIe transfer bottleneck that dominates datacenter GPU proving. This architectural difference creates a unique opportunity for fine-grained CPU-GPU cooperation.
 
 Several projects are exploring this space:
+
 - **[Mopro](https://zkmopro.org/blog/client-side-gpu-everyday-ef-privacy/)** -- Metal MSM acceleration ([v2 write-up](https://zkmopro.org/blog/metal-msm-v2/)), WebGPU field ops benchmarks showing 100x+ throughput on small fields vs BN254
 - **[ICICLE Metal](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44)** -- MSM and NTT primitives for Apple Metal, up to 5x acceleration (v3.6)
 - **[zkSecurity / Stwo WebGPU](https://blog.zksecurity.xyz/posts/webgpu/)** -- 2x overall proving speedup for Circle STARKs in the browser via WebGPU compute shaders
@@ -48,6 +51,7 @@ Our work focuses on a specific, practically relevant target: accelerating the **
 [WHIR](https://eprint.iacr.org/2024/1586) (Fenzi, Hauck, Nghiem; published at [EUROCRYPT 2025](https://iacr.org/cryptodb/data/paper.php?pubkey=35004)) is an Interactive Oracle Proof of proximity for Reed-Solomon codes. It serves as an efficient replacement for [FRI](https://eccc.weizmann.ac.il/report/2017/134/), [STIR](https://eprint.iacr.org/2024/390), and [BaseFold](https://eprint.iacr.org/2023/1705), with notably fast verification (hundreds of microseconds vs. milliseconds for alternatives).
 
 For proving, the dominant costs are:
+
 1. **NTT (Number Theoretic Transform)** -- polynomial evaluation over extension domains
 2. **Merkle tree construction** -- Poseidon2 hashing for polynomial commitments
 3. **Proof-of-work grinding** -- finding nonces satisfying hash difficulty targets (Fiat-Shamir security)
@@ -98,16 +102,18 @@ This fusion eliminates 3-4 CPU-GPU synchronization points per STIR round compare
 
 We went through 30 optimization iterations. The most impactful ones:
 
-| # | Optimization | Impact |
-|---|-------------|--------|
-| 1-4 | Basic Metal NTT + Merkle kernels | Baseline GPU path |
-| 5-8 | Radix-16 DIF, shared-memory butterflies | 2-3x NTT speedup |
-| 9-12 | Fused DFT+Merkle pipeline, zero-copy I/O | 1.5-2x end-to-end |
-| 13-16 | Poseidon2 4-leaf fused kernel, SIMD Merkle | 1.3x Merkle speedup |
-| 17-20 | GPU PoW grinding, zero-copy EF conversions | Helps PoW-dominated configs |
-| 21-24 | Extension field zero-copy, per-round fusion | 1.2x for large n |
-| 25-28 | LTO, `target-cpu=native`, profiling-guided | 10% absolute improvement |
-| 29-30 | R32 DIF kernel, packed transpose bypass | 5-15ms/round savings |
+
+| #     | Optimization                                | Impact                      |
+| ----- | ------------------------------------------- | --------------------------- |
+| 1-4   | Basic Metal NTT + Merkle kernels            | Baseline GPU path           |
+| 5-8   | Radix-16 DIF, shared-memory butterflies     | 2-3x NTT speedup            |
+| 9-12  | Fused DFT+Merkle pipeline, zero-copy I/O    | 1.5-2x end-to-end           |
+| 13-16 | Poseidon2 4-leaf fused kernel, SIMD Merkle  | 1.3x Merkle speedup         |
+| 17-20 | GPU PoW grinding, zero-copy EF conversions  | Helps PoW-dominated configs |
+| 21-24 | Extension field zero-copy, per-round fusion | 1.2x for large n            |
+| 25-28 | LTO, `target-cpu=native`, profiling-guided  | 10% absolute improvement    |
+| 29-30 | R32 DIF kernel, packed transpose bypass     | 5-15ms/round savings        |
+
 
 The most important lesson: **fusing operations to avoid CPU-GPU round-trips matters more than optimizing individual kernels**. The fused pipeline (single command buffer for DFT+Merkle) typically beats the non-fused path by 15-30%.
 
@@ -157,8 +163,9 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 
 #### n=20 (1M coefficients)
 
-| fold | rate | CPU (ms) | Best GPU (ms) | Speedup |
-|------|------|----------|---------------|---------|
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
 | 1    | 1    | 267      | 171           | **1.56x** |
 | 1    | 2    | 453      | 290           | **1.56x** |
 | 1    | 3    | 897      | 483           | **1.86x** |
@@ -169,10 +176,12 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 | 4    | 2    | 89       | 53            | **1.70x** |
 | 4    | 3    | 200      | 120           | **1.67x** |
 
+
 #### n=22 (4M coefficients)
 
-| fold | rate | CPU (ms) | Best GPU (ms) | Speedup |
-|------|------|----------|---------------|---------|
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
 | 1    | 1    | 1174     | 579           | **2.03x** |
 | 1    | 2    | 1938     | 1092          | **1.77x** |
 | 1    | 3    | 3459     | 1934          | **1.79x** |
@@ -189,15 +198,18 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 | 6    | 2    | 410      | 327           | **1.25x** |
 | 6    | 3    | 1763     | 1320          | **1.34x** |
 
+
 #### n=24 (16M coefficients)
 
-| fold | rate | CPU (ms) | Best GPU (ms) | Speedup |
-|------|------|----------|---------------|---------|
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
 | 1    | 1    | 4153     | 2463          | **1.69x** |
 | 2    | 1    | 1814     | 1049          | **1.73x** |
 | 3    | 1    | 890      | 531           | **1.68x** |
 | 4    | 1    | 978      | 694           | **1.41x** |
 | 6    | 1    | 588      | 405           | **1.45x** |
+
 
 > n=24 rate>=2 exceeds the GPU domain cap (2^25 elements) and is not tested.
 
@@ -217,13 +229,15 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 
 Profiling breakdown for a representative configuration (n=24, fold=3, rate=1, total GPU time ~537ms):
 
-| Component | Time | % | Notes |
-|-----------|------|---|-------|
-| GPU Poseidon2 Merkle | ~315 ms | 58% | Compute-bound (Montgomery mul) |
-| GPU DFT (NTT) | ~75 ms | 14% | Memory-bandwidth-limited |
-| CPU sumcheck | ~80 ms | 15% | External crate, SIMD-optimized |
-| CPU constraint combination | ~45 ms | 8% | Partially GPU-offloaded |
-| GPU readback + dispatch | ~24 ms | 4% | Zero-copy already in use |
+
+| Component                  | Time    | %   | Notes                          |
+| -------------------------- | ------- | --- | ------------------------------ |
+| GPU Poseidon2 Merkle       | ~315 ms | 58% | Compute-bound (Montgomery mul) |
+| GPU DFT (NTT)              | ~75 ms  | 14% | Memory-bandwidth-limited       |
+| CPU sumcheck               | ~80 ms  | 15% | External crate, SIMD-optimized |
+| CPU constraint combination | ~45 ms  | 8%  | Partially GPU-offloaded        |
+| GPU readback + dispatch    | ~24 ms  | 4%  | Zero-copy already in use       |
+
 
 **Poseidon2 Merkle dominates.** Each Poseidon2 permutation (width-16) requires 25 rounds of S-box + MDS matrix operations, where each S-box is `x^7 = x * x * x * x * x * x * x` (6 Montgomery multiplications). With millions of leaves to hash and a full binary tree to compress, this is ~58% of the GPU runtime.
 
@@ -231,7 +245,7 @@ Profiling breakdown for a representative configuration (n=24, fold=3, rate=1, to
 
 **NTT is memory-bandwidth-limited** (not compute-limited) because butterfly operations are simple (1 multiply + 1 add per pair) but access non-sequential memory addresses at large strides. Our radix-16/32 kernels reduce the number of global memory passes (see Section 7).
 
-**CPU sumcheck is the remaining bottleneck** -- it lives in the `p3-whir` crate and uses SIMD-optimized polynomial arithmetic. The sumcheck protocol is sequential across rounds (each round requires the verifier's random challenge before the next can begin). Within each round, the computation is parallelizable. We did not attempt to GPU-accelerate the within-round computation; whether this would help depends on whether the data transfer overhead (moving the polynomial to GPU and back each round) would outweigh the compute speedup. For our problem sizes, the within-round computation takes ~5-15ms, and the GPU dispatch + readback overhead is ~1-2ms, so there may be modest room for improvement. This remains future work.
+**CPU sumcheck is the remaining bottleneck** -- it lives in Plonky3's `p3-whir` crate and uses SIMD-optimized polynomial arithmetic. The sumcheck protocol is sequential across rounds (each round requires the verifier's random challenge before the next can begin). Within each round, the computation is parallelizable. We did not attempt to GPU-accelerate the within-round computation; whether this would help depends on whether the data transfer overhead (moving the polynomial to GPU and back each round) would outweigh the compute speedup. For our problem sizes, the within-round computation takes ~5-15ms, and the GPU dispatch + readback overhead is ~1-2ms, so there may be modest room for improvement. This remains future work.
 
 ---
 
@@ -239,15 +253,18 @@ Profiling breakdown for a representative configuration (n=24, fold=3, rate=1, to
 
 The most common bottleneck reported by GPU proving projects is **CPU-GPU data transfer**. On discrete GPUs, transferring a 64MB polynomial over PCIe takes ~4ms (16 GB/s) -- comparable to the NTT computation itself. On Apple Silicon, CPU and GPU access the same physical DRAM, so this PCIe cost is eliminated entirely.
 
-However, unified memory is not a free lunch. Metal offers two buffer storage modes, and the choice matters significantly:
+However, unified memory is not free of tradeoffs. Metal offers two buffer storage modes, and the choice matters significantly:
 
 ### Shared mode (`MTLResourceStorageModeShared`)
+
 Both CPU and GPU can read/write the buffer. The hardware must maintain **cache coherence** -- when the GPU reads data the CPU recently wrote, the CPU's caches must be flushed so the GPU sees the latest values, and vice versa. This coherence has a performance cost:
+
 - GPU reads from shared buffers are slower than from GPU-managed buffers
 - The memory controller must mediate between CPU and GPU caches
 - For large buffers, the cache flush can add ~0.1-0.5ms
 
 ### Managed mode (`MTLResourceStorageModePrivate`)
+
 Only the GPU can access the buffer. No cache coherence is needed, so the GPU gets full memory bandwidth without contention. This is faster for GPU-intensive computation.
 
 ### Our hybrid approach
@@ -277,6 +294,7 @@ The Number Theoretic Transform (NTT) is the finite-field analog of the FFT. Ther
 **Stockham auto-sort** ([Stockham, 1966](https://doi.org/10.1145/1464291.1464352)): An out-of-place variant that avoids the separate bit-reversal permutation by alternating between two buffers. Each stage reads from one buffer and writes to the other in a different order, so the output of the final stage is already in the correct order. The downside is 2x memory usage.
 
 We settled on **DIF** as the primary algorithm for several reasons:
+
 1. DIF's output is bit-reversed, but we need bit-reversed order anyway for the Merkle tree (leaves must be in evaluation-domain order). We fuse the bit-reversal with the last NTT stage, eliminating a separate permutation pass.
 2. DIF naturally pairs with radix-16/32 decomposition (see below).
 3. DIF's stride pattern works well with Apple GPU's memory subsystem.
@@ -298,6 +316,7 @@ Radix-32: Each butterfly: ~100 mul + add.  Passes for 2^24:  ~5
 Since our NTT is **memory-bandwidth-limited** (each pass reads and writes the entire array), halving the number of passes roughly halves the runtime. The cost is more ALU work per pass, but GPU ALUs are underutilized during bandwidth-limited NTT passes, so the trade is favorable.
 
 We use **radix-16 as the workhorse** because:
+
 - 16 elements per butterfly = 16 registers, which fits comfortably in Apple GPU's register file
 - Each thread processes 16 elements with 4 "layers" of radix-2 butterflies internally (since 16 = 2^4)
 - Radix-32 (5 internal layers, 32 registers) also works and saves one pass for 2^24, but provides diminishing returns for smaller NTTs
@@ -326,6 +345,7 @@ The [four-step FFT algorithm](https://doi.org/10.1109/29.1532) (Bailey, 1990) de
 The appeal is that the row/column NTTs are small enough to fit entirely in threadgroup shared memory (32KB on Apple GPU), avoiding global memory access during the butterfly stages. Only the transpose requires a global memory pass.
 
 In practice, this was **20% slower** than our flat DIF approach because:
+
 - The matrix transpose is not free -- it requires a global memory pass with poor coalescing patterns
 - Shared memory bank conflicts during the row/column NTTs (16 elements per row = stride-16 access = worst-case bank conflicts on Apple GPU's 32-bank shared memory)
 - The extra twiddle multiply pass adds another global memory round-trip
@@ -334,33 +354,32 @@ In practice, this was **20% slower** than our flat DIF approach because:
 ### What didn't work
 
 1. **Overlapping DFT readback with Merkle GPU work.** We tried using Metal events to let the CPU read NTT results from the shared buffer while the GPU started Merkle hashing on a separate managed buffer. This was **slower** because the CPU reads competed with the GPU for unified memory bandwidth. On Apple Silicon, the memory bus is shared, so CPU reads during heavy GPU compute effectively steal bandwidth cycles.
-
 2. **GPU sumcheck.** The [sumcheck protocol](https://doi.org/10.1145/146585.146605) (Lund, Fortnow, Karloff, Nisan, 1992) has a sequential round structure: each round, the prover computes a univariate polynomial over a hypercube, the verifier sends a random challenge, and the prover "folds" the hypercube for the next round. This round-to-round dependency is inherently serial.
-
-   We did **not** implement or benchmark GPU sumcheck. The sequential structure makes it a poor fit for GPU parallelism in principle, but we have not empirically verified this for our specific workload sizes. The within-round computation (summing over 2^(n-i) elements in round i) is embarrassingly parallel and could potentially benefit from GPU acceleration for early rounds with large hypercubes. This remains an open question. The [Thaler 2022 survey](https://doi.org/10.1561/0400000066) provides a thorough treatment of the sumcheck protocol and its optimization.
+  We did **not** implement or benchmark GPU sumcheck. The sequential structure makes it a poor fit for GPU parallelism in principle, but we have not empirically verified this for our specific workload sizes. The within-round computation (summing over 2^(n-i) elements in round i) is embarrassingly parallel and could potentially benefit from GPU acceleration for early rounds with large hypercubes. This remains an open question. The [Thaler 2022 survey](https://doi.org/10.1561/0400000066) provides a thorough treatment of the sumcheck protocol and its optimization.
 
 ### Practical challenges
 
 - **Benchmark variance from PoW.** Proof-of-work grinding has exponentially distributed completion times (searching for a random nonce). Single-run benchmarks can vary by 50%+ for PoW-heavy configurations. Using the median of 3 runs significantly reduces this noise.
-
 - **Compiler optimizations help the CPU more than the GPU.** LTO and `target-cpu=native` improved CPU performance by ~25% but had minimal effect on GPU kernel performance (Metal shaders are compiled separately from Rust code). This narrowed the GPU/CPU ratio despite improving absolute performance.
-
 - **Thermal throttling on mobile.** Extended benchmark runs on laptops (and especially phones) can trigger thermal throttling, reducing GPU clock speeds. Our benchmarks use the median of 3 runs to mitigate this, but real-world sustained performance may be lower.
 
 ---
 
 ## 8. Comparison with Related Work
 
-| Project | Target | Protocol | Speedup | Field | API | Source |
-|---------|--------|----------|---------|-------|-----|--------|
-| **This work** | Apple M1 GPU | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal | [repo](https://github.com/miha-stopar/whir-p3-metal) |
-| Mopro Metal MSM v2 | Apple GPU | MSM (BN254) | 40-100x vs v1 | BN254 (254-bit) | Metal | [write-up](https://zkmopro.org/blog/metal-msm-v2/), [code](https://github.com/zkmopro/gpu-acceleration) |
-| ICICLE Metal v3.6 | Apple GPU | MSM, NTT | up to 5x | Multiple | Metal | [blog](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44), [docs](https://dev.ingonyama.com/) |
-| ICICLE-Stwo (CUDA) | Datacenter GPU | Circle STARK | 3.25-7x vs CPU SIMD | M31 (31-bit) | CUDA | [blog](https://medium.com/@ingonyama/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover-550b413d4f88) |
-| zkSecurity Stwo WebGPU | Browser GPU | Circle STARK | 2x overall | M31 | WebGPU | [write-up](https://blog.zksecurity.xyz/posts/webgpu/), [PR](https://github.com/zksecurity/stwo/pull/10) |
-| Ligetron | Browser/native | SHA-256, NTT | N/A (WIP) | Multiple | WebGPU | [code](https://github.com/ligeroinc/ligero-prover) |
+
+| Project                | Target         | Protocol       | Speedup             | Field             | API    | Source                                                                                                        |
+| ---------------------- | -------------- | -------------- | ------------------- | ----------------- | ------ | ------------------------------------------------------------------------------------------------------------- |
+| **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/miha-stopar/whir-p3-metal)                                                          |
+| Mopro Metal MSM v2     | Apple GPU      | MSM (BN254)    | 40-100x vs v1       | BN254 (254-bit)   | Metal  | [write-up](https://zkmopro.org/blog/metal-msm-v2/), [code](https://github.com/zkmopro/gpu-acceleration)       |
+| ICICLE Metal v3.6      | Apple GPU      | MSM, NTT       | up to 5x            | Multiple          | Metal  | [blog](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44), [docs](https://dev.ingonyama.com/) |
+| ICICLE-Stwo (CUDA)     | Datacenter GPU | Circle STARK   | 3.25-7x vs CPU SIMD | M31 (31-bit)      | CUDA   | [blog](https://medium.com/@ingonyama/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover-550b413d4f88)      |
+| zkSecurity Stwo WebGPU | Browser GPU    | Circle STARK   | 2x overall          | M31               | WebGPU | [write-up](https://blog.zksecurity.xyz/posts/webgpu/), [PR](https://github.com/zksecurity/stwo/pull/10)       |
+| Ligetron               | Browser/native | SHA-256, NTT   | N/A (WIP)           | Multiple          | WebGPU | [code](https://github.com/ligeroinc/ligero-prover)                                                            |
+
 
 Our speedup numbers (1.3-2.0x) are more modest than MSM-focused projects because:
+
 1. **We benchmark end-to-end proving**, including CPU-bound sumcheck rounds. The GPU-only portions (NTT + Merkle) show 3-4x speedup over non-SIMD CPU code.
 2. **Our CPU baseline is extremely strong** -- Plonky3's BabyBear uses NEON SIMD 4-wide packed arithmetic, plus LTO and native CPU codegen.
 3. **WHIR's workload is hash-dominated** (Poseidon2 Merkle ~58% of runtime), which has high arithmetic intensity but limited parallelism reduction compared to MSM.
@@ -372,15 +391,19 @@ Note that the Mopro MSM v2 speedup (40-100x vs v1) compares against their own v1
 ## 9. Future Directions
 
 ### Higher-arity Merkle trees
+
 The Poseidon2 Merkle kernel dominates runtime (58%). A 4-ary or 8-ary tree would reduce the number of hash invocations by 2-3x, proportionally speeding up the GPU pipeline. This requires protocol-level changes in the WHIR commitment scheme.
 
 ### Newer Apple Silicon
+
 Our benchmarks are on M1 (2020). The M4 Max has 40 GPU cores (vs 8 on M1) and 273 GB/s memory bandwidth (vs 68 GB/s). We expect 3-4x improvement from hardware alone. The repository includes a `bench.sh` script and an iOS app to make cross-device benchmarking easy -- contributions welcome.
 
 ### WebGPU backend
+
 For cross-platform reach, a WebGPU ([wgpu](https://github.com/gfx-rs/wgpu)) backend could reuse the same kernel algorithms in WGSL. The main costs would be losing the shared/managed memory distinction (WebGPU has a simpler memory model) and WGSL's lack of `mulhi` intrinsic (requiring emulation). Mopro's [field operation benchmarks](https://zkmopro.org/blog/client-side-gpu-everyday-ef-privacy/) suggest WebGPU achieves ~50-80% of Metal performance for field operations.
 
 ### GPU sumcheck
+
 The sumcheck protocol is the main remaining CPU bottleneck (~15% of runtime). While the round-to-round dependency is inherently serial, the *within-round* computation (summing over a large hypercube) could benefit from GPU parallelism for very large instances. We have not benchmarked this and it remains an open question.
 
 ---
@@ -392,6 +415,7 @@ All code is open source: **[github.com/miha-stopar/whir-p3-metal](https://github
 Based on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3) (WHIR implementation using [Plonky3](https://github.com/Plonky3/Plonky3)).
 
 ### Running on Mac
+
 ```bash
 # Install Rust nightly
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
@@ -405,6 +429,7 @@ cd whir-p3-metal
 ```
 
 ### Running on iPhone
+
 ```bash
 cd ios
 ./build-rust.sh      # builds Rust static library for iOS
@@ -413,4 +438,5 @@ open WhirBench.xcodeproj  # build and run on device
 ```
 
 ### Detailed optimization log
-See [`docs/gpu-optimizations.md`](https://github.com/miha-stopar/whir-p3-metal/blob/main/docs/gpu-optimizations.md) for a detailed log of all 30 optimization iterations with before/after benchmarks.
+
+See `[docs/gpu-optimizations.md](https://github.com/miha-stopar/whir-p3-metal/blob/main/docs/gpu-optimizations.md)` for a detailed log of all 30 optimization iterations with before/after benchmarks.
